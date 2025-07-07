@@ -27,6 +27,7 @@ models:
   int8: false
   half: false
   base_half: false
+  scoring_model_name: ""  # Additional scoring model name
 
 # Perturbation Configuration (for ai_detector.py)
 perturbation:
@@ -45,6 +46,20 @@ perturbation:
 processing:
   batch_size: 50
   n_similarity_samples: 20
+  n_samples: 5  # Number of samples for processing
+  min_len: 0  # Minimum length for text processing
+  max_len: 128  # Maximum length for text processing
+
+# Sampling Configuration (for ai_detector.py)
+sampling:
+  do_top_k: false  # Use top-k sampling
+  do_top_p: false  # Use top-p sampling
+  temperature: 1.0  # Temperature for sampling
+
+# Dataset Configuration (for ai_detector.py)
+dataset:
+  name: "functions"  # Dataset name
+  key: ""  # Dataset key
 
 # Output Configuration
 output:

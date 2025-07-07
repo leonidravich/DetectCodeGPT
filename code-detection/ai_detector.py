@@ -427,6 +427,17 @@ def create_args_from_config(config):
             self.output_name = config.get('output', {}).get('output_name', 'test_ipynb')
             self.visualize = config.get('output', {}).get('visualize', False)
             
+            # Additional required arguments for preprocessing
+            self.do_top_k = config.get('sampling', {}).get('do_top_k', False)
+            self.do_top_p = config.get('sampling', {}).get('do_top_p', False)
+            self.scoring_model_name = config.get('models', {}).get('scoring_model_name', '')
+            self.n_samples = config.get('processing', {}).get('n_samples', 5)
+            self.temperature = config.get('sampling', {}).get('temperature', 1.0)
+            self.dataset = config.get('dataset', {}).get('name', 'functions')
+            self.dataset_key = config.get('dataset', {}).get('key', '')
+            self.min_len = config.get('processing', {}).get('min_len', 0)
+            self.max_len = config.get('processing', {}).get('max_len', 128)
+            
     
     return Args(config)
 
