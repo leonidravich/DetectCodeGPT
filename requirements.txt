@@ -24,3 +24,9 @@ tree-sitter
 
 # Web requests (for API calls)
 requests
+
+# Configuration
+PyYAML
+
+# Database
+duckdb

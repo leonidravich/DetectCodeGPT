@@ -1,0 +1,52 @@
+# DetectCodeGPT Configuration File
+# This file contains all configuration parameters for folder_lader.py and ai_detector.py
+
+# Database Configuration
+database:
+  path: "functions.db"
+  drop_existing: false
+
+# Repository Configuration (for folder_lader.py)
+repository:
+  path: "."
+  search: null  # Search query for functions
+  stats: false  # Show database statistics
+
+# Function Filtering (for ai_detector.py)
+filtering:
+  limit: null  # Limit number of functions to process
+  function_type: null  # Filter by function type (function, method, class_method, staticmethod)
+  file_pattern: null  # Filter by file path pattern
+
+# Model Configuration (for ai_detector.py)
+models:
+  base_model_name: "codellama/CodeLlama-7b-hf"
+  mask_filling_model_name: "Salesforce/codet5p-770m"
+  device: "cuda"
+  cache_dir: "~/.cache/huggingface/hub"
+  int8: false
+  half: false
+  base_half: false
+
+# Perturbation Configuration (for ai_detector.py)
+perturbation:
+  pct_words_masked: 0.5
+  pct_identifiers_masked: 0.75
+  span_length: 2
+  n_perturbation_rounds: 1
+  perturb_type: "random"  # Options: random, identifier-masking, random-line-shuffle, random-insert-newline, random-insert-space, random-insert-space-newline, random-insert-space+newline
+  buffer_size: 1
+  mask_top_p: 1.0
+  mask_temperature: 1.0
+  chunk_size: 10
+  n_perturbations: 10  # Number of perturbations per function
+
+# Processing Configuration (for ai_detector.py)
+processing:
+  batch_size: 50
+  n_similarity_samples: 20
+
+# Output Configuration
+output:
+  output_name: "test_ipynb"
+  visualize: false  # Generate visualization plots
