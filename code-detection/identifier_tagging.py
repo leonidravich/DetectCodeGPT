@@ -1,53 +1,162 @@
 from transformers import RobertaTokenizer
 import argparse
 from loguru import logger
-from tree_sitter import Language, Parser
 import os
 from tqdm import tqdm
 import json
 import numpy as np
 import pdb
+import re
+
+# Try to import tree-sitter, with fallback if not available
+try:
+    from tree_sitter import Language, Parser
+    
+    # Check if we have the tree-sitter grammars
+    grammar_dirs = [
+        './tree-sitter/tree-sitter-python',
+        './tree-sitter/tree-sitter-java',
+        './tree-sitter/tree-sitter-php',
+        './tree-sitter/tree-sitter-go',
+        './tree-sitter/tree-sitter-ruby',
+        './tree-sitter/tree-sitter-javascript',
+    ]
+    
+    # Check if any grammar directories exist
+    grammar_exists = any(os.path.exists(grammar_dir) for grammar_dir in grammar_dirs)
+    
+    if grammar_exists and not os.path.exists('build/my-languages.so'):
+        try:
+            # Use the new tree-sitter API
+            Language.build_library(
+                # Store the library in the `build` directory
+                'build/my-languages.so',
+                # Include one or more languages
+                [grammar_dir for grammar_dir in grammar_dirs if os.path.exists(grammar_dir)]
+            )
+        except Exception as e:
+            logger.warning(f"Failed to build tree-sitter library: {e}")
+            grammar_exists = False
+    elif os.path.exists('build/my-languages.so'):
+        logger.info('build/my-languages.so already exists, skip building')
+    else:
+        logger.warning("Tree-sitter grammar directories not found, using fallback method")
+        grammar_exists = False
+    
+    if grammar_exists:
+        PYTHON_LANGUAGE = Language('build/my-languages.so', 'python')
+        JAVA_LANGUAGE = Language('build/my-languages.so', 'java')
+        PHP_LANGUAGE = Language('build/my-languages.so', 'php')
+        GO_LANGUAGE = Language('build/my-languages.so', 'go')
+        RUBY_LANGUAGE = Language('build/my-languages.so', 'ruby')
+        JAVASCRIPT_LANGUAGE = Language('build/my-languages.so', 'javascript')
+
+        # map from language to tree-sitter language
+        LANGUAGE_MAP = {
+            'java': JAVA_LANGUAGE,
+            'python': PYTHON_LANGUAGE,
+            'php': PHP_LANGUAGE,
+            'go': GO_LANGUAGE,
+            'ruby': RUBY_LANGUAGE,
+            'javascript': JAVASCRIPT_LANGUAGE,
+        }
+        parser = Parser()
+        TREE_SITTER_AVAILABLE = True
+    else:
+        TREE_SITTER_AVAILABLE = False
+        
+except ImportError:
+    logger.warning("tree-sitter not available, using fallback method")
+    TREE_SITTER_AVAILABLE = False
 
 
-if not os.path.exists('build/my-languages.so'):
-    Language.build_library(
-        # Store the library in the `build` directory
-        'build/my-languages.so',
-
-        # Include one or more languages
-        [
-            './tree-sitter/tree-sitter-python',
-            './tree-sitter/tree-sitter-java',
-            './tree-sitter/tree-sitter-php',
-            './tree-sitter/tree-sitter-go',
-            './tree-sitter/tree-sitter-ruby',
-            './tree-sitter/tree-sitter-javascript',
-        ]
-    )
-else:
-    logger.info('build/my-languages.so already exists, skip building')
-
-PYTHON_LANGUAGE = Language('build/my-languages.so', 'python')
-JAVA_LANGUAGE = Language('build/my-languages.so', 'java')
-PHP_LANGUAGE = Language('build/my-languages.so', 'php')
-GO_LANGUAGE = Language('build/my-languages.so', 'go')
-RUBY_LANGUAGE = Language('build/my-languages.so', 'ruby')
-JAVASCRIPT_LANGUAGE = Language('build/my-languages.so', 'javascript')
-
-# map from language to tree-sitter language
-LANGUAGE_MAP = {
-    'java': JAVA_LANGUAGE,
-    'python': PYTHON_LANGUAGE,
-    'php': PHP_LANGUAGE,
-    'go': GO_LANGUAGE,
-    'ruby': RUBY_LANGUAGE,
-    'javascript': JAVASCRIPT_LANGUAGE,
-}
-
-parser = Parser()
+def get_identifier_fallback(code, lang):
+    """Fallback method using regex to extract identifiers when tree-sitter is not available."""
+    identifiers = []
+    pos = []
+    
+    # Python identifier pattern
+    if lang == 'python':
+        # Pattern for Python identifiers (variable names, function names, etc.)
+        pattern = r'\b[a-zA-Z_][a-zA-Z0-9_]*\b'
+        matches = list(re.finditer(pattern, code))
+        
+        for match in matches:
+            identifier = match.group()
+            # Skip Python keywords and common built-ins
+            python_keywords = {
+                'False', 'None', 'True', 'and', 'as', 'assert', 'break', 'class', 'continue', 
+                'def', 'del', 'elif', 'else', 'except', 'finally', 'for', 'from', 'global', 
+                'if', 'import', 'in', 'is', 'lambda', 'nonlocal', 'not', 'or', 'pass', 
+                'raise', 'return', 'try', 'while', 'with', 'yield', 'self', 'cls'
+            }
+            
+            if identifier not in python_keywords and not identifier.startswith('__'):
+                # Calculate position
+                start_line = code[:match.start()].count('\n')
+                start_col = match.start() - code.rfind('\n', 0, match.start()) - 1
+                end_line = code[:match.end()].count('\n')
+                end_col = match.end() - code.rfind('\n', 0, match.end()) - 1
+                
+                pos.append(((start_line, start_col), (end_line, end_col)))
+                identifiers.append(identifier)
+    
+    # Java identifier pattern
+    elif lang == 'java':
+        pattern = r'\b[a-zA-Z_$][a-zA-Z0-9_$]*\b'
+        matches = list(re.finditer(pattern, code))
+        
+        for match in matches:
+            identifier = match.group()
+            # Skip Java keywords
+            java_keywords = {
+                'abstract', 'assert', 'boolean', 'break', 'byte', 'case', 'catch', 'char', 
+                'class', 'const', 'continue', 'default', 'do', 'double', 'else', 'enum', 
+                'extends', 'final', 'finally', 'float', 'for', 'goto', 'if', 'implements', 
+                'import', 'instanceof', 'int', 'interface', 'long', 'native', 'new', 
+                'package', 'private', 'protected', 'public', 'return', 'short', 'static', 
+                'strictfp', 'super', 'switch', 'synchronized', 'this', 'throw', 'throws', 
+                'transient', 'try', 'void', 'volatile', 'while'
+            }
+            
+            if identifier not in java_keywords:
+                start_line = code[:match.start()].count('\n')
+                start_col = match.start() - code.rfind('\n', 0, match.start()) - 1
+                end_line = code[:match.end()].count('\n')
+                end_col = match.end() - code.rfind('\n', 0, match.end()) - 1
+                
+                pos.append(((start_line, start_col), (end_line, end_col)))
+                identifiers.append(identifier)
+    
+    # Generic fallback for other languages
+    else:
+        pattern = r'\b[a-zA-Z_][a-zA-Z0-9_]*\b'
+        matches = list(re.finditer(pattern, code))
+        
+        for match in matches:
+            identifier = match.group()
+            start_line = code[:match.start()].count('\n')
+            start_col = match.start() - code.rfind('\n', 0, match.start()) - 1
+            end_line = code[:match.end()].count('\n')
+            end_col = match.end() - code.rfind('\n', 0, match.end()) - 1
+            
+            pos.append(((start_line, start_col), (end_line, end_col)))
+            identifiers.append(identifier)
+    
+    return list(set(identifiers)), pos
 
 
 def get_identifier(code, lang):
+    """Extract identifiers from code using tree-sitter or fallback method."""
+    if TREE_SITTER_AVAILABLE and lang in LANGUAGE_MAP:
+        return get_identifier_tree_sitter(code, lang)
+    else:
+        logger.info(f"Using fallback method for language: {lang}")
+        return get_identifier_fallback(code, lang)
+
+
+def get_identifier_tree_sitter(code, lang):
+    """Original tree-sitter based identifier extraction."""
     pos = []
     identifiers = []
 
@@ -67,7 +176,6 @@ def get_identifier(code, lang):
                 pos.insert(0, (start_point, end_point))
             traverse(child)
 
-
     parser.set_language(LANGUAGE_MAP[lang])
     tree = parser.parse(bytes(code, 'utf-8'))
     traverse(tree.root_node)
@@ -78,11 +186,8 @@ def get_identifier(code, lang):
 
 
 def get_identifier_from_position(code_string, start_point, end_point):
-
     lines = code_string.splitlines()
-
     identifier = lines[start_point[0]][start_point[1]:end_point[1]]
-    # logger.info(f'identifier: {identifier}\n\n')
     return identifier
 
 
