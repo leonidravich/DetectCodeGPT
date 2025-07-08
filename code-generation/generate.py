@@ -4,6 +4,7 @@ import numpy as np
 import re
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSeq2SeqLM
+from datasets import load_dataset
 from loguru import logger
 import gzip
 import json
@@ -19,13 +20,14 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # device = torch.device('cpu')
 
 
-def load_data(path='data/CodeSearchNet', language='python', max_num=10000):
+def load_data(dataset_name='code_search_net', language='python', max_num=10000):
 
     all_prompts = []
     all_solutions = []
 
-    if 'humaneval' in path:
-        path_to_data = f'{path}/{language}/data/humaneval_{language}.jsonl.gz'
+    if 'humaneval' in dataset_name:
+        # For HumanEval, we still need to load from local files
+        path_to_data = f'data/{dataset_name}/{language}/data/humaneval_{language}.jsonl.gz'
 
         logger.info(f'Loading data from {path_to_data}')
 
@@ -37,11 +39,24 @@ def load_data(path='data/CodeSearchNet', language='python', max_num=10000):
                 all_prompts.append(data['prompt'])
                 all_solutions.append(data['canonical_solution'])
 
-    elif 'CodeSearchNet' in path:
+    elif 'code_search_net' in dataset_name:
 
-        path_to_data = f'{path}/{language}/train.jsonl'
+        logger.info(f'Loading CodeSearchNet dataset from Hugging Face datasets')
 
-        logger.info(f'Loading data from {path_to_data}')
+        # Load the dataset from Hugging Face
+        ds = load_dataset("code_search_net", "python", trust_remote_code=True)
+        
+        # Use the train split
+        dataset = ds['train']
+
+        # Debug: Check the structure of the dataset
+        logger.info(f'Dataset features: {dataset.features}')
+        logger.info(f'First example: {dataset[0]}')
+        
+        # Check what fields are available
+        if len(dataset) > 0:
+            first_example = dataset[0]
+            logger.info(f'Available fields: {list(first_example.keys())}')
 
         failed = 0
         success = 0
@@ -52,36 +67,65 @@ def load_data(path='data/CodeSearchNet', language='python', max_num=10000):
         max_solution_len = 256
         min_solution_len = 5
 
-        with open(path_to_data, 'r') as f:
+        for data in tqdm(dataset):
+            
+            # Use func_code_string instead of original_string
+            if 'func_code_string' not in data:
+                logger.warning(f'Field "func_code_string" not found in data. Available fields: {list(data.keys())}')
+                failed += 1
+                continue
 
-            count = 0
-            for line in tqdm(f):
+            # For CodeSearchNet, we'll use the function code as the solution
+            # and create a simple prompt from the function name and documentation
+            func_code = data['func_code_string']
+            func_name = data.get('func_name', 'function')
+            func_doc = data.get('func_documentation_string', '')
+            
+            # Create a simple prompt from function name and documentation
+            if func_doc:
+                prompt = f"# {func_name}\n{func_doc}\n\ndef {func_name}("
+            else:
+                prompt = f"def {func_name}("
+            
+            # Extract the function body as solution
+            try:
+                # Find the function definition and extract the body
+                lines = func_code.split('\n')
+                # Skip the function definition line and get the body
+                body_lines = []
+                in_function = False
+                for line in lines:
+                    if line.strip().startswith('def ') and not in_function:
+                        in_function = True
+                        continue
+                    if in_function:
+                        body_lines.append(line)
+                
+                solution = '\n'.join(body_lines).strip()
+                
+                # If we couldn't extract properly, use the whole function
+                if not solution:
+                    solution = func_code
+                
+                success += 1
+            except:
+                failed += 1
+                continue
 
-                data = json.loads(line)
+            if len(prompt.split()) > max_prompt_len or len(prompt.split()) < min_prompt_len:
+                continue
 
-                data['original_string'] = data['original_string'].replace("'''", '"""')
-                try:
-                    prompt = data['original_string'].split('"""')[0] + '"""' + data['original_string'].split('"""')[1] + '"""'
-                    solution = data['original_string'].split('"""')[2]
-                    success += 1
-                except:
-                    failed += 1
+            if len(solution.split()) > max_solution_len or len(solution.split()) < min_solution_len:
+                continue
 
-
-                if len(prompt.split()) > max_prompt_len or len(prompt.split()) < min_prompt_len:
-                    continue
-
-                if len(solution.split()) > max_solution_len or len(solution.split()) < min_solution_len:
-                    continue
-
-                all_prompts.append(prompt)
-                all_solutions.append(solution)
+            all_prompts.append(prompt)
+            all_solutions.append(solution)
 
         logger.info(f'Failed: {failed}, Success: {success}')
 
-    elif "TheVault" in path:
+    elif "TheVault" in dataset_name:
 
-        path_to_data = f'{path}/{language}/small_train.jsonl'
+        path_to_data = f'data/{dataset_name}/{language}/small_train.jsonl'
 
         logger.info(f'Loading data from {path_to_data}')
 
@@ -124,10 +168,14 @@ def load_data(path='data/CodeSearchNet', language='python', max_num=10000):
     logger.info(f'Loaded {len(all_prompts)} prompts and {len(all_solutions)} solutions')
 
     # analyze the lengths
-    prompt_lengths = [len(prompt.split()) for prompt in all_prompts]
-    solution_lengths = [len(solution.split()) for solution in all_solutions]
-    logger.info(f'Prompt lengths: min: {min(prompt_lengths)}, max: {max(prompt_lengths)}, mean: {np.mean(prompt_lengths)}, std: {np.std(prompt_lengths)}')
-    logger.info(f'Solution lengths: min: {min(solution_lengths)}, max: {max(solution_lengths)}, mean: {np.mean(solution_lengths)}, std: {np.std(solution_lengths)}')
+    if len(all_prompts) > 0:
+        prompt_lengths = [len(prompt.split()) for prompt in all_prompts]
+        solution_lengths = [len(solution.split()) for solution in all_solutions]
+        logger.info(f'Prompt lengths: min: {min(prompt_lengths)}, max: {max(prompt_lengths)}, mean: {np.mean(prompt_lengths)}, std: {np.std(prompt_lengths)}')
+        logger.info(f'Solution lengths: min: {min(solution_lengths)}, max: {max(solution_lengths)}, mean: {np.mean(solution_lengths)}, std: {np.std(solution_lengths)}')
+    else:
+        logger.warning('No data was loaded successfully!')
+        return [], []
 
     if len(all_prompts) > max_num:
 
@@ -279,11 +327,11 @@ def generate_hf(model_name, prompts, solutions, batch_size=16, max_length_sample
 
 if __name__ == "__main__":
 
-    # path = 'data/CodeSearchNet'
-    # path = "data/TheVault"
+    # dataset_name = 'code_search_net'
+    # dataset_name = "TheVault"
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--path', type=str, default="data/CodeSearchNet")
+    parser.add_argument('--dataset_name', type=str, default="code_search_net")
     parser.add_argument('--max_num', type=int, default=100000)
     parser.add_argument('--temperature', type=float, default=0.2)
     parser.add_argument('--model_name', type=str, default='codeparrot/codeparrot')
@@ -293,14 +341,14 @@ if __name__ == "__main__":
 
     logger.info(f'args: {args}')
 
-    path = args.path
+    dataset_name = args.dataset_name
     max_num = args.max_num
     temperature = args.temperature
     model_name = args.model_name
     batch_size = args.batch_size
 
     # max_num = 100000
-    prompts, solutions = load_data(path=path, language='python', max_num=max_num)
+    prompts, solutions = load_data(dataset_name=dataset_name, language='python', max_num=max_num)
 
 
     prompts, outputs, solutions = generate_hf(model_name, prompts, solutions, max_length_sample=args.max_length,
@@ -312,7 +360,7 @@ if __name__ == "__main__":
 
     # write the outputs to a file and together with the prompts and solutions
 
-    save_prefix = f'output/{path.split("/")[-1]}'
+    save_prefix = f'output/{dataset_name}'
 
     file_name = f'{save_prefix}/{model_name}-{max_num}-tp{temperature}/outputs.txt'
     if not os.path.exists(f'{save_prefix}/{model_name}-{max_num}-tp{temperature}'):
