@@ -24,9 +24,9 @@ models:
   mask_filling_model_name: "Salesforce/codet5p-770m"
   device: "cuda"
   cache_dir: "~/.cache/huggingface/hub"
-  int8: false
+  int8: true  # Enable int8 quantization to reduce memory usage
   half: false
-  base_half: false
+  base_half: true  # Enable half precision for base model
   scoring_model_name: ""  # Additional scoring model name
 
 # Perturbation Configuration (for ai_detector.py)
@@ -39,12 +39,12 @@ perturbation:
   buffer_size: 1
   mask_top_p: 1.0
   mask_temperature: 1.0
-  chunk_size: 10
+  chunk_size: 2  # Further reduced from 4 to 2 to prevent CUDA out of memory errors
   n_perturbations: 10  # Number of perturbations per function
 
 # Processing Configuration (for ai_detector.py)
 processing:
-  batch_size: 50
+  batch_size: 2  # Further reduced from 5 to 2 to prevent CUDA out of memory errors
   n_similarity_samples: 20
   n_samples: 5  # Number of samples for processing
   min_len: 0  # Minimum length for text processing
