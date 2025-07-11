@@ -15,6 +15,7 @@ import numpy as np
 import torch
 import functools
 import re
+import scipy.stats
 from typing import List, Dict, Any, Optional, Tuple
 from tqdm import tqdm
 from loguru import logger
@@ -173,21 +174,78 @@ class AIDetector:
         """Optimized batch processing of perturbations."""
         span_length = self.args.span_length
         pct = self.args.pct_words_masked
+        lambda_poisson = self.args.span_length
         
         # Vectorized masking
         if self.args.perturb_type == 'random':
             masked_texts = self._tokenize_and_mask_batch(texts, span_length, pct, ceil_pct)
         elif self.args.perturb_type == 'identifier-masking':
             masked_texts = self._tokenize_and_mask_identifiers_batch(texts, span_length, pct, ceil_pct)
+        elif self.args.perturb_type == 'random-line-shuffle':
+            perturbed_texts = [self._random_line_shuffle(x, pct) for x in texts]
+            return perturbed_texts
+        elif self.args.perturb_type == 'random-insert-newline':
+            perturbed_texts = [self._random_insert_newline(x, pct, lambda_poisson) for x in texts]
+            return perturbed_texts
+        elif self.args.perturb_type == 'random-insert-space':
+            perturbed_texts = [self._random_insert_space(x, pct, lambda_poisson) for x in texts]
+            return perturbed_texts
+        elif self.args.perturb_type == 'random-insert-space-newline':
+            perturbed_texts = [self._random_insert_space(x, pct, lambda_poisson) for x in texts]
+            perturbed_texts = [self._random_insert_newline(x, pct, lambda_poisson) for x in perturbed_texts]
+            return perturbed_texts
+        elif self.args.perturb_type == 'random-insert-space+newline':
+            perturbed_texts_part1 = [self._random_insert_space(x, pct, lambda_poisson) for x in texts]
+            perturbed_texts_part2 = [self._random_insert_newline(x, pct, lambda_poisson) for x in texts]
+            total_num = len(perturbed_texts_part1)
+            n1 = int(total_num / 2)
+            n2 = total_num - n1
+            perturbed_texts_part1 = perturbed_texts_part1[:n1]
+            perturbed_texts_part2 = perturbed_texts_part2[:n2]
+            return perturbed_texts_part1 + perturbed_texts_part2
         else:
             raise ValueError(f'Unknown perturb_type: {self.args.perturb_type}')
         
-        # Batch model inference
+        # Batch model inference (only for masking-based perturbations)
         raw_fills = self._replace_masks_batch(masked_texts)
         extracted_fills = self._extract_fills_batch(raw_fills)
         perturbed_texts = self._apply_extracted_fills_batch(masked_texts, extracted_fills)
         
         return perturbed_texts
+    
+    def _random_line_shuffle(self, text: str, pct: float = 0.3) -> str:
+        """Randomly exchange the order of two adjacent lines for pct of the lines, except for the first and last line."""
+        lines = text.split('\n')
+        n_lines = len(lines)
+        n_shuffled = int(n_lines * pct)
+        shuffled_idxs = np.random.choice(n_lines, n_shuffled, replace=False)
+        for idx in shuffled_idxs:
+            if idx == n_lines - 1 or idx == 0:
+                continue
+            lines[idx], lines[idx+1] = lines[idx+1], lines[idx]
+        return '\n'.join(lines)
+    
+    def _random_insert_newline(self, text: str, pct: float = 0.3, mean: int = 1) -> str:
+        """Randomly insert a newline for pct of the lines."""
+        lines = text.split('\n')
+        n_lines = len(lines)
+        n_inserted = int(n_lines * pct)
+        inserted_idxs = np.random.choice(n_lines, n_inserted, replace=False)
+        for idx in inserted_idxs:
+            n_newlines = 1
+            lines[idx] = lines[idx] + '\n'*n_newlines
+        return '\n'.join(lines)
+    
+    def _random_insert_space(self, text: str, pct: float = 0.3, mean: int = 1) -> str:
+        """Randomly insert a space for pct of the lines."""
+        tokens = text.split(' ')
+        n_tokens = len(tokens)
+        n_inserted = int(n_tokens * pct)
+        inserted_idxs = np.random.choice(n_tokens, n_inserted, replace=False)
+        for idx in inserted_idxs:
+            n_spaces = scipy.stats.poisson.rvs(mean) + 1
+            tokens[idx] = tokens[idx] + ' '*n_spaces
+        return ' '.join(tokens)
     
     def _tokenize_and_mask_batch(self, texts: List[str], span_length: int, pct: float, ceil_pct: bool = False) -> List[str]:
         """Vectorized tokenization and masking."""
@@ -474,30 +532,6 @@ class AIDetector:
         """Calculate detection scores for functions (now uses optimized version)."""
         return self.calculate_scores_optimized(functions, n_perturbations)
     
-    def get_performance_stats(self) -> Dict[str, Any]:
-        """Get performance statistics and optimization info."""
-        stats = {
-            'optimizations_applied': [
-                'Batch processing for model inference',
-                'Vectorized text operations',
-                'Cached regex patterns',
-                'Parallel identifier extraction',
-                'GPU memory optimization with torch.no_grad()',
-                'Larger batch sizes for better GPU utilization'
-            ],
-            'memory_optimizations': [
-                'Reduced memory allocations',
-                'Filtered empty masks before processing',
-                'Efficient numpy operations'
-            ],
-            'speed_improvements': [
-                'Parallel processing for CPU-bound tasks',
-                'Batch rank calculations',
-                'Optimized mask replacement'
-            ]
-        }
-        return stats
-
 
 def setup_args():
     """Setup and parse command line arguments."""
@@ -629,7 +663,7 @@ def main():
     # Create args object from config
     args = create_args_from_config(config)
     
-    logger.info("Starting AI detection process with OPTIMIZED perturbation...")
+    logger.info(f"Starting AI detection process with cuda: {torch.cuda.is_available()} {torch.cuda.get_device_name(0)}")
     
     # Load functions from database
     loader = FunctionLoader(args.db_path)
@@ -657,20 +691,6 @@ def main():
     
     # Initialize AI detector
     detector = AIDetector(args)
-    
-    # Show optimization info
-    perf_stats = detector.get_performance_stats()
-    print(f"\n🚀 OPTIMIZATIONS APPLIED:")
-    for opt in perf_stats['optimizations_applied']:
-        print(f"  ✓ {opt}")
-    
-    print(f"\n⚡ SPEED IMPROVEMENTS:")
-    for imp in perf_stats['speed_improvements']:
-        print(f"  ✓ {imp}")
-    
-    print(f"\n💾 MEMORY OPTIMIZATIONS:")
-    for mem in perf_stats['memory_optimizations']:
-        print(f"  ✓ {mem}")
     
     # Calculate scores with timing
     import time
