@@ -5,12 +5,20 @@
 database:
   path: "functions.db"
   drop_existing: false
+  repo_name: "detectcodegpt"  # Repository name to analyze
+  year: 2025  # Year to analyze (null = auto-detect first available year)
 
 # Repository Configuration (for folder_lader.py)
 repository:
   path: "."
+  name: "detectcodegpt"  # Repository name for table naming
+  year: 2025  # Year for table naming (defaults to current year if not specified)
   search: null  # Search query for functions
   stats: false  # Show database statistics
+  git:
+    enabled: true  # Enable git repository functionality
+    use_worktree: true  # Use git worktree for year-based extraction
+    cleanup_worktree: true  # Automatically cleanup temporary worktrees
 
 # Function Filtering (for ai_detector.py)
 filtering:
@@ -22,8 +30,8 @@ filtering:
 models:
   base_model_name: "codellama/CodeLlama-7b-hf"
   mask_filling_model_name: "Salesforce/codet5p-770m"
-  device: "cuda"
-  cache_dir: "~/.cache/huggingface/hub"
+  device: "auto"  # Options: "cuda", "cpu", "auto" (auto-detect)
+  cache_dir: "huggingface/hub"
   int8: true  # Enable int8 quantization to reduce memory usage
   half: false
   base_half: true  # Enable half precision for base model
@@ -35,7 +43,8 @@ perturbation:
   pct_identifiers_masked: 0.75
   span_length: 2
   n_perturbation_rounds: 1
-  perturb_type: "random"  # Options: random, identifier-masking, random-line-shuffle, random-insert-newline, random-insert-space, random-insert-space-newline, random-insert-space+newline
+  perturb_type: "random-insert-space+newline"  # Options: random, identifier-masking, random-line-shuffle, random-insert-newline, random-insert-space, random-insert-space-newline, random-insert-space+newline
+  # Note: Only 'random' and 'identifier-masking' require mask filling model (saves memory for other types)
   buffer_size: 1
   mask_top_p: 1.0
   mask_temperature: 1.0
@@ -49,6 +58,13 @@ processing:
   n_samples: 5  # Number of samples for processing
   min_len: 0  # Minimum length for text processing
   max_len: 128  # Maximum length for text processing
+
+# CPU Optimization Settings (uncomment for CPU-only systems)
+# processing:
+#   batch_size: 1  # Reduce for CPU
+#   n_perturbations: 5  # Reduce for CPU
+# perturbation:
+#   chunk_size: 1  # Reduce for CPU
 
 # Sampling Configuration (for ai_detector.py)
 sampling:

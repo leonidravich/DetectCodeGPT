@@ -45,18 +45,59 @@ REGEX_CACHE = {
 
 
 class FunctionLoader:
-    """Loads functions from DuckDB database."""
+    """Loads functions from DuckDB database with year-specific tables."""
     
-    def __init__(self, db_path: str = "functions.db"):
+    def __init__(self, db_path: str = "functions.db", repo_name: str = "default", year: int = None):
         self.db_path = db_path
+        self.repo_name = repo_name
+        self.year = year
         self.conn = duckdb.connect(db_path)
+        
+        # If year is not specified, try to find available years
+        if self.year is None:
+            self.year = self._get_available_years()[0] if self._get_available_years() else None
+    
+    def _get_available_years(self) -> List[int]:
+        """Get list of available years in the database."""
+        try:
+            # List all tables and extract years
+            result = self.conn.execute("SHOW TABLES").fetchall()
+            years = []
+            for row in result:
+                table_name = row[0]
+                # Look for pattern: {repo_name}_{year}_functions
+                if table_name.endswith('_functions'):
+                    parts = table_name.split('_')
+                    if len(parts) >= 2:
+                        try:
+                            year = int(parts[-2])  # Second to last part should be year
+                            years.append(year)
+                        except ValueError:
+                            continue
+            return sorted(years)
+        except Exception as e:
+            logger.error(f"Error getting available years: {e}")
+            return []
+    
+    def _get_table_name(self, base_name: str) -> str:
+        """Generate table name with repo and year prefix."""
+        return f"{self.repo_name}_{self.year}_{base_name}"
     
     def get_functions(self, limit: Optional[int] = None, 
                      function_type: Optional[str] = None,
                      file_pattern: Optional[str] = None) -> List[Dict[str, Any]]:
         """Load functions from database with optional filters."""
         
-        query = "SELECT id, name, file_path, line_number, function_type, class_name, source_code FROM functions"
+        functions_table = self._get_table_name("functions")
+        
+        # Check if table exists
+        try:
+            result = self.conn.execute(f"SELECT COUNT(*) FROM {functions_table} LIMIT 1").fetchone()
+        except:
+            logger.error(f"Table {functions_table} does not exist")
+            return []
+        
+        query = f"SELECT id, name, file_path, line_number, function_type, class_name, source_code FROM {functions_table}"
         conditions = []
         params = []
         
@@ -94,29 +135,124 @@ class FunctionLoader:
     
     def get_function_stats(self) -> Dict[str, Any]:
         """Get statistics about stored functions."""
+        functions_table = self._get_table_name("functions")
         stats = {}
         
-        # Total functions
-        result = self.conn.execute("SELECT COUNT(*) FROM functions").fetchone()
-        stats['total_functions'] = result[0] if result else 0
-        
-        # Functions by type
-        result = self.conn.execute("""
-            SELECT function_type, COUNT(*) 
-            FROM functions 
-            GROUP BY function_type
-        """).fetchall()
-        stats['by_type'] = dict(result)
-        
-        # Unique files
-        result = self.conn.execute("SELECT COUNT(DISTINCT file_path) FROM functions").fetchone()
-        stats['unique_files'] = result[0] if result else 0
+        try:
+            # Total functions
+            result = self.conn.execute(f"SELECT COUNT(*) FROM {functions_table}").fetchone()
+            stats['total_functions'] = result[0] if result else 0
+            
+            # Functions by type
+            result = self.conn.execute(f"""
+                SELECT function_type, COUNT(*) 
+                FROM {functions_table} 
+                GROUP BY function_type
+            """).fetchall()
+            stats['by_type'] = dict(result)
+            
+            # Unique files
+            result = self.conn.execute(f"SELECT COUNT(DISTINCT file_path) FROM {functions_table}").fetchone()
+            stats['unique_files'] = result[0] if result else 0
+            
+            # Add repository and year info
+            stats['repository'] = self.repo_name
+            stats['year'] = self.year
+            
+        except Exception as e:
+            logger.error(f"Error getting function stats: {e}")
+            stats = {
+                'total_functions': 0,
+                'by_type': {},
+                'unique_files': 0,
+                'repository': self.repo_name,
+                'year': self.year
+            }
         
         return stats
+    
+    def list_available_repositories(self) -> List[Dict[str, Any]]:
+        """List all available repositories and years in the database."""
+        try:
+            result = self.conn.execute("SHOW TABLES").fetchall()
+            repos = {}
+            
+            for row in result:
+                table_name = row[0]
+                if table_name.endswith('_functions'):
+                    parts = table_name.split('_')
+                    if len(parts) >= 2:
+                        try:
+                            year = int(parts[-2])
+                            repo_name = '_'.join(parts[:-2])  # Everything before year
+                            if repo_name not in repos:
+                                repos[repo_name] = []
+                            repos[repo_name].append(year)
+                        except ValueError:
+                            continue
+            
+            # Convert to list format
+            repo_list = []
+            for repo_name, years in repos.items():
+                repo_list.append({
+                    'name': repo_name,
+                    'years': sorted(years),
+                    'total_years': len(years)
+                })
+            
+            return repo_list
+            
+        except Exception as e:
+            logger.error(f"Error listing repositories: {e}")
+            return []
     
     def close(self):
         """Close the database connection."""
         self.conn.close()
+
+    def get_functions_for_multiple_years(self, years: List[int], limit: Optional[int] = None, 
+                                       function_type: Optional[str] = None,
+                                       file_pattern: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Load functions from multiple years."""
+        all_functions = []
+        
+        for year in years:
+            self.year = year
+            functions = self.get_functions(limit, function_type, file_pattern)
+            # Add year information to each function
+            for func in functions:
+                func['year'] = year
+            all_functions.extend(functions)
+        
+        return all_functions
+    
+    def get_function_stats_for_multiple_years(self, years: List[int]) -> Dict[str, Any]:
+        """Get statistics for multiple years."""
+        all_stats = []
+        
+        for year in years:
+            self.year = year
+            stats = self.get_function_stats()
+            all_stats.append(stats)
+        
+        # Aggregate statistics
+        total_functions = sum(stats['total_functions'] for stats in all_stats)
+        total_files = sum(stats['unique_files'] for stats in all_stats)
+        
+        # Aggregate by type
+        by_type = {}
+        for stats in all_stats:
+            for func_type, count in stats['by_type'].items():
+                by_type[func_type] = by_type.get(func_type, 0) + count
+        
+        return {
+            'total_functions': total_functions,
+            'unique_files': total_files,
+            'by_type': by_type,
+            'repository': self.repo_name,
+            'years': years,
+            'year_stats': all_stats
+        }
 
 
 class AIDetector:
@@ -129,6 +265,11 @@ class AIDetector:
         # Setup models
         self._setup_models()
     
+    def _is_mask_model_required(self) -> bool:
+        """Check if the current perturbation type requires the mask filling model."""
+        mask_required_types = ['random', 'identifier-masking']
+        return self.args.perturb_type in mask_required_types
+    
     def _setup_models(self):
         """Setup the base model and mask filling model."""
         logger.info("Setting up models...")
@@ -137,10 +278,17 @@ class AIDetector:
         cache_dir, base_model_name, SAVE_FOLDER = preprocess_and_save(self.args)
         self.model_config['cache_dir'] = cache_dir
         
-        # Load mask filling model
-        self.model_config = load_mask_filling_model(self.args, self.args.mask_filling_model_name, self.model_config)
+        # Check if mask filling model is needed
+        if self._is_mask_model_required():
+            logger.info(f"Loading mask filling model for perturbation type: {self.args.perturb_type}")
+            # Load mask filling model
+            self.model_config = load_mask_filling_model(self.args, self.args.mask_filling_model_name, self.model_config)
+        else:
+            logger.info(f"Mask filling model not required for perturbation type: {self.args.perturb_type}")
+            logger.info("Skipping mask model loading to save memory and startup time")
         
-        # Load base model
+        # Load base model (always required for rank calculation)
+        logger.info("Loading base model for rank calculation...")
         self.model_config = load_base_model_and_tokenizer(self.args, self.model_config)
         
         logger.info("Models loaded successfully")
@@ -362,6 +510,11 @@ class AIDetector:
         if max(n_expected) == 0:
             return texts
         
+        # Safety check: ensure mask model is loaded
+        if 'mask_model' not in self.model_config or 'mask_tokenizer' not in self.model_config:
+            raise RuntimeError("Mask filling model not loaded but required for current perturbation type. "
+                             "Please use 'random' or 'identifier-masking' perturbation types, or ensure mask model is loaded.")
+        
         # Filter out texts with no masks to avoid unnecessary processing
         texts_with_masks = [(i, text) for i, text in enumerate(texts) if n_expected[i] > 0]
         
@@ -562,16 +715,25 @@ def create_args_from_config(config):
         def __init__(self, config):
             # Database arguments
             self.db_path = config.get('database', {}).get('path', 'functions.db')
+            self.repo_name = config.get('database', {}).get('repo_name', 'default')
+            self.year = config.get('database', {}).get('year', None)
             
             # Filtering arguments
-            self.limit = config.get('filtering', {}).get('limit')
+            self.limit = config.get('filtering', {}).get('limit', None)
             self.function_type = config.get('filtering', {}).get('function_type')
             self.file_pattern = config.get('filtering', {}).get('file_pattern')
             
             # Model arguments
             self.base_model_name = config.get('models', {}).get('base_model_name', 'codellama/CodeLlama-7b-hf')
             self.mask_filling_model_name = config.get('models', {}).get('mask_filling_model_name', 'Salesforce/codet5p-770m')
-            self.DEVICE = config.get('models', {}).get('device', 'cuda')
+            
+            # Handle device selection
+            device_config = config.get('models', {}).get('device', 'auto')
+            if device_config == 'auto':
+                self.DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+            else:
+                self.DEVICE = device_config
+            
             self.cache_dir = config.get('models', {}).get('cache_dir', '~/.cache/huggingface/hub')
             self.int8 = config.get('models', {}).get('int8', False)
             self.half = config.get('models', {}).get('half', False)
@@ -625,6 +787,8 @@ def print_results(results: List[Dict[str, Any]]):
         print(f"  Type: {result['function_type']}")
         if result['class_name']:
             print(f"  Class: {result['class_name']}")
+        if 'year' in result:
+            print(f"  Year: {result['year']}")
         
         print(f"  DetectCodeGPT Score: {result['detectcodegpt_score']:.4f}")
         print(f"  Original Rank: {result['original_rank']:.4f}")
@@ -638,6 +802,16 @@ def print_results(results: List[Dict[str, Any]]):
     detectcodegpt_scores = [r['detectcodegpt_score'] for r in results]
     
     print(f"Number of functions processed: {len(results)}")
+    
+    # Show year breakdown if available
+    if 'year' in results[0]:
+        years = list(set(r['year'] for r in results))
+        print(f"Years processed: {sorted(years)}")
+        for year in sorted(years):
+            year_results = [r for r in results if r['year'] == year]
+            year_scores = [r['detectcodegpt_score'] for r in year_results]
+            print(f"  {year}: {len(year_results)} functions, mean score: {np.mean(year_scores):.4f}")
+    
     print(f"\nDetectCodeGPT Scores:")
     print(f"  Mean: {np.mean(detectcodegpt_scores):.4f}")
     print(f"  Std: {np.std(detectcodegpt_scores):.4f}")
@@ -663,31 +837,84 @@ def main():
     # Create args object from config
     args = create_args_from_config(config)
     
-    logger.info(f"Starting AI detection process with cuda: {torch.cuda.is_available()} {torch.cuda.get_device_name(0)}")
+    # Log device information
+    if args.DEVICE == 'cuda':
+        device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "Unknown"
+        logger.info(f"Starting AI detection process with CUDA: {device_name}")
+    else:
+        logger.info(f"Starting AI detection process with {args.DEVICE.upper()}")
+        if args.DEVICE == 'cpu':
+            logger.warning("CPU mode detected - processing will be significantly slower")
+            logger.info("Consider reducing batch_size and n_perturbations for better performance")
     
     # Load functions from database
-    loader = FunctionLoader(args.db_path)
+    loader = FunctionLoader(args.db_path, args.repo_name, args.year)
+    
+    # Show available repositories
+    available_repos = loader.list_available_repositories()
+    print(f"\nAvailable repositories in database:")
+    for repo in available_repos:
+        print(f"  {repo['name']}: {repo['years']} ({repo['total_years']} years)")
+    
+    # Determine which years to process
+    if args.year is None:
+        # Process all available years for the repository
+        target_repo = next((repo for repo in available_repos if repo['name'] == args.repo_name), None)
+        if target_repo:
+            years_to_process = target_repo['years']
+            print(f"\nProcessing all available years for {args.repo_name}: {years_to_process}")
+        else:
+            logger.error(f"Repository {args.repo_name} not found in database")
+            return
+    else:
+        years_to_process = [args.year]
+        print(f"\nProcessing specific year: {args.year}")
     
     # Show database statistics
-    stats = loader.get_function_stats()
-    print(f"\nDatabase Statistics:")
-    print(f"  Total functions: {stats['total_functions']}")
-    print(f"  Unique files: {stats['unique_files']}")
-    print(f"  Functions by type: {stats['by_type']}")
+    if len(years_to_process) == 1:
+        stats = loader.get_function_stats()
+        print(f"\nDatabase Statistics for {stats['repository']} ({stats['year']}):")
+        print(f"  Total functions: {stats['total_functions']}")
+        print(f"  Unique files: {stats['unique_files']}")
+        print(f"  Functions by type: {stats['by_type']}")
+    else:
+        stats = loader.get_function_stats_for_multiple_years(years_to_process)
+        print(f"\nDatabase Statistics for {stats['repository']} ({stats['years']}):")
+        print(f"  Total functions: {stats['total_functions']}")
+        print(f"  Unique files: {stats['unique_files']}")
+        print(f"  Functions by type: {stats['by_type']}")
+        print(f"  Year breakdown:")
+        for year_stat in stats['year_stats']:
+            print(f"    {year_stat['year']}: {year_stat['total_functions']} functions")
     
     # Load functions with filters
-    functions = loader.get_functions(
-        limit=args.limit,
-        function_type=args.function_type,
-        file_pattern=args.file_pattern
-    )
+    if len(years_to_process) == 1:
+        functions = loader.get_functions(
+            limit=args.limit,
+            function_type=args.function_type,
+            file_pattern=args.file_pattern
+        )
+    else:
+        functions = loader.get_functions_for_multiple_years(
+            years_to_process,
+            limit=args.limit,
+            function_type=args.function_type,
+            file_pattern=args.file_pattern
+        )
     
     if not functions:
-        logger.warning("No functions found matching the criteria")
-        loader.close()
-        return
+        raise ValueError("No functions found matching the criteria")
     
     print(f"\nProcessing {len(functions)} functions...")
+    
+    # Show model loading information
+    mask_required_types = ['random', 'identifier-masking']
+    if args.perturb_type in mask_required_types:
+        print(f"Perturbation type '{args.perturb_type}' requires mask filling model")
+        print(f"Will load: Base model + Mask filling model")
+    else:
+        print(f"Perturbation type '{args.perturb_type}' does not require mask filling model")
+        print(f"Will load: Base model only (saving memory)")
     
     # Initialize AI detector
     detector = AIDetector(args)

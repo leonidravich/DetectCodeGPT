@@ -9,7 +9,9 @@ using AST parsing, and stores them in DuckDB with comprehensive metadata.
 import os
 import ast
 import duckdb
-import hashlib
+import subprocess
+import tempfile
+import shutil
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Union
 from dataclasses import dataclass
@@ -39,8 +41,11 @@ class FunctionInfo:
     return_annotation: Optional[str]
     is_async: bool
     is_generator: bool
-    file_hash: str
-    function_hash: str
+    # Git commit metadata
+    commit_hash: Optional[str] = None
+    commit_date: Optional[str] = None
+    commit_author: Optional[str] = None
+    commit_message: Optional[str] = None
 
 
 class CodeExtractor:
@@ -48,16 +53,357 @@ class CodeExtractor:
     
     def __init__(self, repo_path: str = "."):
         self.repo_path = Path(repo_path).resolve()
+        self.original_repo_path = self.repo_path  # Store the original path
         self.functions = []
+        self.original_commit = None
+        self.temp_worktree = None
+        self.skipped_functions_count = 0  # Statistics for skipped functions
         
-    def get_file_hash(self, file_path: str) -> str:
-        """Generate SHA256 hash of file content."""
-        with open(file_path, 'rb') as f:
-            return hashlib.sha256(f.read()).hexdigest()
+    def get_last_commit_of_year(self, year: int) -> Optional[str]:
+        """Get the last commit hash of a specific year."""
+        logger.info(f"LEO Getting last commit of {self.original_repo_path}")
+        try:
+            # Get the last commit of the specified year
+            result = subprocess.run(
+                ['git', 'log', '--format=%H', f'--since={year}-01-01', f'--until={year}-12-31', '-1'],
+                cwd=self.original_repo_path,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            
+            commit_hash = result.stdout.strip()
+            if commit_hash:
+                logger.info(f"Found last commit of {year}: {commit_hash[:8]}")
+                return commit_hash
+            else:
+                logger.warning(f"No commits found for year {year}")
+                return None
+                
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Error getting last commit of {year}: {e}")
+            return None
     
-    def get_function_hash(self, source_code: str) -> str:
-        """Generate SHA256 hash of function source code."""
-        return hashlib.sha256(source_code.encode('utf-8')).hexdigest()
+    def get_first_commit_of_year(self, year: int) -> Optional[str]:
+        """Get the first commit hash of a specific year."""
+        try:
+            # Get the first commit of the specified year
+            result = subprocess.run(
+                ['git', 'log', '--reverse', '--format=%H', f'--since={year}-01-01', f'--until={year}-12-31'],
+                cwd=self.original_repo_path,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            
+            lines = result.stdout.strip().split('\n')
+            if lines and lines[0]:
+                commit_hash = lines[0].strip()
+                logger.info(f"Found first commit of {year}: {commit_hash[:8]}")
+                return commit_hash
+            else:
+                logger.warning(f"No commits found for year {year}")
+                return None
+                
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Error getting first commit of {year}: {e}")
+            return None
+    
+    def get_current_commit(self) -> Optional[str]:
+        """Get the current commit hash."""
+        try:
+            result = subprocess.run(
+                ['git', 'rev-parse', 'HEAD'],
+                cwd=self.original_repo_path,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            return result.stdout.strip()
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Error getting current commit: {e}")
+            return None
+    
+    def create_temp_worktree(self, commit_hash: str) -> Optional[str]:
+        """Create a temporary worktree for a specific commit."""
+        try:
+            # Create a temporary directory for the worktree
+            temp_dir = tempfile.mkdtemp(prefix=f"git_worktree_{commit_hash[:8]}_")
+            
+            # Use the original repository path for git commands
+            original_repo_path = self.original_repo_path
+            
+            logger.info(f"Creating worktree at {temp_dir}")
+            
+            # Create a new worktree
+            result = subprocess.run(
+                ['git', 'worktree', 'add', '--detach', temp_dir, commit_hash],
+                cwd=original_repo_path,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            
+            logger.info(f"Created temporary worktree at {temp_dir} for commit {commit_hash[:8]}")
+            return temp_dir
+            
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Error creating worktree for commit {commit_hash[:8]}: {e}")
+            if 'temp_dir' in locals() and os.path.exists(temp_dir):
+                try:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                except:
+                    pass
+            return None
+    
+    def cleanup_temp_worktree(self):
+        """Clean up the temporary worktree."""
+        if self.temp_worktree:
+            logger.info(f"Attempting to cleanup worktree: {self.temp_worktree}")
+            
+            try:
+                # First, try to remove the worktree using git
+                if os.path.exists(self.temp_worktree):
+                    logger.info(f"Removing git worktree: {self.temp_worktree}")
+                    subprocess.run(
+                        ['git', 'worktree', 'remove', '--force', self.temp_worktree],
+                        cwd=self.original_repo_path,
+                        capture_output=True,
+                        check=False
+                    )
+                    
+                    # Wait a moment for the worktree to be fully removed
+                    import time
+                    time.sleep(2)
+                    
+                    # Remove the directory if it still exists
+                    if os.path.exists(self.temp_worktree):
+                        logger.info(f"Force removing directory: {self.temp_worktree}")
+                        try:
+                            # On Windows, we need to be more careful with directory removal
+                            import shutil
+                            shutil.rmtree(self.temp_worktree, ignore_errors=True)
+                            
+                            # Double-check if it's gone
+                            if os.path.exists(self.temp_worktree):
+                                logger.warning(f"Directory still exists after rmtree: {self.temp_worktree}")
+                            else:
+                                logger.info(f"Successfully removed worktree directory: {self.temp_worktree}")
+                                
+                        except Exception as e:
+                            logger.error(f"Could not remove worktree directory {self.temp_worktree}: {e}")
+                    else:
+                        logger.info(f"Git worktree removal successful: {self.temp_worktree}")
+                else:
+                    logger.info(f"Worktree directory does not exist: {self.temp_worktree}")
+                    
+            except Exception as e:
+                logger.error(f"Error during worktree cleanup: {e}")
+            finally:
+                self.temp_worktree = None
+                logger.info("Worktree cleanup completed")
+    
+    def cleanup_existing_worktrees(self):
+        """Clean up any existing worktrees that might be left over."""
+        try:
+            logger.info("Checking for existing worktrees...")
+            result = subprocess.run(
+                ['git', 'worktree', 'list'],
+                cwd=self.original_repo_path,
+                capture_output=True,
+                text=True,
+                check=False
+            )
+            
+            if result.returncode == 0 and result.stdout.strip():
+                lines = result.stdout.strip().split('\n')
+                for line in lines:
+                    if line.strip() and '[detached' in line:
+                        # Extract worktree path
+                        parts = line.split()
+                        if len(parts) >= 1:
+                            worktree_path = parts[0]
+                            if worktree_path != self.original_repo_path:
+                                logger.info(f"Found existing worktree: {worktree_path}")
+                                try:
+                                    subprocess.run(
+                                        ['git', 'worktree', 'remove', '--force', worktree_path],
+                                        cwd=self.original_repo_path,
+                                        capture_output=True,
+                                        check=False
+                                    )
+                                    logger.info(f"Removed existing worktree: {worktree_path}")
+                                except Exception as e:
+                                    logger.warning(f"Could not remove existing worktree {worktree_path}: {e}")
+            else:
+                logger.info("No existing worktrees found")
+                
+        except Exception as e:
+            logger.warning(f"Error checking existing worktrees: {e}")
+
+    def setup_repository_for_year(self, year: int) -> bool:
+        """Set up the repository to work with the specified year."""
+        # Clean up any existing worktrees first
+        self.cleanup_existing_worktrees()
+        
+        # Clean up any existing temporary worktree
+        self.cleanup_temp_worktree()
+        
+        # Get the last commit of the specified year
+        target_commit = self.get_last_commit_of_year(year)
+        if not target_commit:
+            raise Exception(f"No commits found for year {year}")
+        
+        # Store current commit
+        self.original_commit = self.get_current_commit()
+        
+        # Try to create temporary worktree for the target commit
+        self.temp_worktree = self.create_temp_worktree(target_commit)
+        if not self.temp_worktree:
+            raise Exception("Failed to create temporary worktree")
+        
+        # Update repo_path to point to the temporary worktree
+        self.repo_path = Path(self.temp_worktree)
+        logger.info(f"Repository set up for year {year} at commit {target_commit[:8]}")
+        return True
+    
+    def get_first_repo_commit(self) -> Optional[int]:
+        """Get the year of the first commit in the repository."""
+        try:
+            result = subprocess.run(
+                ['git', '--no-pager', 'log', '--reverse', '--format=%cd', '--date=format:%Y'],
+                cwd=self.original_repo_path,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            
+            lines = result.stdout.strip().split('\n')
+            if lines and lines[0]:
+                year_str = lines[0].strip()
+                return int(year_str)
+            return None
+                
+        except (subprocess.CalledProcessError, ValueError) as e:
+            logger.error(f"Error getting first commit year: {e}")
+            return None
+    
+    def get_last_repo_commit(self) -> Optional[int]:
+        """Get the year of the last commit in the repository."""
+        try:
+            result = subprocess.run(
+                ['git', '--no-pager', 'log', '--format=%cd', '--date=format:%Y', '-1'],
+                cwd=self.original_repo_path,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            
+            year_str = result.stdout.strip()
+            if year_str:
+                return int(year_str)
+            return None
+                
+        except (subprocess.CalledProcessError, ValueError) as e:
+            logger.error(f"Error getting last commit year: {e}")
+            return None
+    
+    def get_git_info(self) -> Dict[str, Any]:
+        """Get git repository information."""
+        info = {
+            'is_git_repo': True,  # Always true since we assume git repos only
+            'current_commit': self.get_current_commit(),
+            'first_commit_year': self.get_first_repo_commit(),
+            'last_commit_year': self.get_last_repo_commit()
+        }
+        
+        return info
+    
+    def get_file_commit_info(self, file_path: str, line_number: int) -> Dict[str, Any]:
+        """Get commit information for a specific line in a file."""
+        try:
+            # Get the commit that introduced this line
+            result = subprocess.run(
+                ['git', 'blame', '-L', f'{line_number},{line_number}', '--porcelain', file_path],
+                cwd=self.repo_path,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            
+            lines = result.stdout.strip().split('\n')
+            if not lines or not lines[0]:
+                return {}
+            
+            # Parse git blame output
+            commit_hash = lines[0].split()[0]
+            
+            # Extract additional info from porcelain format
+            commit_info = {'commit_hash': commit_hash}
+            
+            for line in lines[1:]:
+                if line.startswith('author '):
+                    commit_info['commit_author'] = line[7:]
+                elif line.startswith('author-time '):
+                    timestamp = int(line[12:])
+                    commit_info['commit_date'] = datetime.fromtimestamp(timestamp).isoformat()
+                elif line.startswith('summary '):
+                    commit_info['commit_message'] = line[8:]
+            
+            return commit_info
+            
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"Error getting commit info for {file_path}:{line_number}: {e}")
+            return {}
+    
+    def get_file_changes_in_year(self, file_path: str, year: int) -> List[Dict[str, Any]]:
+        """Get all commits that modified a file in a specific year."""
+        try:
+            result = subprocess.run(
+                ['git', 'log', '--format=%H|%an|%at|%s', f'--since={year}-01-01', f'--until={year}-12-31', '--', file_path],
+                cwd=self.repo_path,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            
+            changes = []
+            for line in result.stdout.strip().split('\n'):
+                if line:
+                    parts = line.split('|')
+                    if len(parts) >= 4:
+                        timestamp = int(parts[2])
+                        changes.append({
+                            'commit_hash': parts[0],
+                            'author': parts[1],
+                            'date': datetime.fromtimestamp(timestamp).isoformat(),
+                            'message': parts[3]
+                        })
+            
+            return changes
+            
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"Error getting changes for {file_path} in {year}: {e}")
+            return []
+    
+    def is_function_modified_in_year(self, file_path: str, start_line: int, end_line: int, year: int) -> bool:
+        """Check if a function (line range) was modified in the specified year."""
+        try:
+            # Get commits that modified this line range in the specified year
+            result = subprocess.run(
+                ['git', 'log', '--format=%H', f'--since={year}-01-01', f'--until={year}-12-31', 
+                 '-L', f'{start_line},{end_line}:{file_path}'],
+                cwd=self.repo_path,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            
+            return bool(result.stdout.strip())
+            
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"Error checking if function was modified in {year}: {e}")
+            return False
     
     def extract_docstring(self, node: ast.AST) -> Optional[str]:
         """Extract docstring from AST node."""
@@ -144,8 +490,23 @@ class CodeExtractor:
             return ''.join(lines[start_line-1:end_line])
     
     def visit_function(self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef], 
-                      file_path: str, class_name: Optional[str] = None) -> FunctionInfo:
+                      file_path: str, class_name: Optional[str] = None, target_year: Optional[int] = None) -> Optional[FunctionInfo]:
         """Extract information from a function or method."""
+        # Check if function was modified in target year AS EARLY AS POSSIBLE
+        if target_year:
+            try:
+                was_modified_in_year = self.is_function_modified_in_year(
+                    file_path, node.lineno, node.end_lineno, target_year
+                )
+                
+                # If we're filtering by year and function wasn't modified, skip it immediately
+                if not was_modified_in_year:
+                    self.skipped_functions_count += 1
+                    return None
+            except Exception as e:
+                logger.warning(f"Error checking if function {node.name} was modified in {file_path}: {e}")
+                # Continue processing if we can't determine modification status
+        
         # Determine function type
         if class_name:
             decorators = self.get_decorators(node)
@@ -169,9 +530,15 @@ class CodeExtractor:
         # Get source code
         source_code = self.get_source_code(file_path, node.lineno, node.end_lineno)
         
-        # Generate hashes
-        file_hash = self.get_file_hash(file_path)
-        function_hash = self.get_function_hash(source_code)
+        # Get git commit information
+        commit_info = {}
+        was_modified_in_year = True  # Default to True since we already checked above
+        
+        try:
+            # Get commit info for the function's first line
+            commit_info = self.get_file_commit_info(file_path, node.lineno)
+        except Exception as e:
+            logger.warning(f"Error getting git info for function {node.name} in {file_path}: {e}")
         
         return FunctionInfo(
             name=node.name,
@@ -188,22 +555,25 @@ class CodeExtractor:
             return_annotation=return_annotation,
             is_async=is_async,
             is_generator=is_generator,
-            file_hash=file_hash,
-            function_hash=function_hash
+            commit_hash=commit_info.get('commit_hash'),
+            commit_date=commit_info.get('commit_date'),
+            commit_author=commit_info.get('commit_author'),
+            commit_message=commit_info.get('commit_message')
         )
     
-    def visit_class(self, node: ast.ClassDef, file_path: str):
+    def visit_class(self, node: ast.ClassDef, file_path: str, target_year: Optional[int] = None):
         """Visit class and extract its methods."""
         for item in node.body:
             if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 try:
-                    function_info = self.visit_function(item, file_path, node.name)
-                    self.functions.append(function_info)
+                    function_info = self.visit_function(item, file_path, node.name, target_year)
+                    if function_info:  # Only append if function_info is not None (i.e., not filtered out)
+                        self.functions.append(function_info)
                 except Exception as e:
                     logger.warning(f"Error processing method {item.name} in class {node.name} in {file_path}: {e}")
                     continue
     
-    def visit_file(self, file_path: str):
+    def visit_file(self, file_path: str, target_year: Optional[int] = None):
         """Parse a Python file and extract all functions and methods."""
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
@@ -223,15 +593,16 @@ class CodeExtractor:
                     
                     if not parent_class:  # Top-level function
                         try:
-                            function_info = self.visit_function(node, file_path)
-                            self.functions.append(function_info)
+                            function_info = self.visit_function(node, file_path, target_year=target_year)
+                            if function_info:  # Only append if function_info is not None (i.e., not filtered out)
+                                self.functions.append(function_info)
                         except Exception as e:
                             logger.warning(f"Error processing function {node.name} in {file_path}: {e}")
                             continue
                 
                 elif isinstance(node, ast.ClassDef):
                     try:
-                        self.visit_class(node, file_path)
+                        self.visit_class(node, file_path, target_year)
                     except Exception as e:
                         logger.warning(f"Error processing class {node.name} in {file_path}: {e}")
                         continue
@@ -243,53 +614,94 @@ class CodeExtractor:
         except Exception as e:
             logger.error(f"Error parsing {file_path}: {e}")
     
-    def scan_repository(self) -> List[FunctionInfo]:
+    def scan_repository(self, year: Optional[int] = None) -> List[FunctionInfo]:
         """Recursively scan the repository for Python files and extract functions."""
         logger.info(f"Scanning repository: {self.repo_path}")
         
-        # Find all Python files
-        python_files = []
-        for root, dirs, files in os.walk(self.repo_path):
-            # Skip common directories to ignore
-            dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ['__pycache__', 'node_modules', '.git']]
+        try:
+            # Find all Python files
+            python_files = []
+            for root, dirs, files in os.walk(self.repo_path):
+                # Skip common directories to ignore
+                dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ['__pycache__', 'node_modules', '.git']]
+                
+                for file in files:
+                    if file.endswith('.py'):
+                        python_files.append(os.path.join(root, file))
             
-            for file in files:
-                if file.endswith('.py'):
-                    python_files.append(os.path.join(root, file))
-        
-        logger.info(f"Found {len(python_files)} Python files")
-        
-        # Extract functions from each file
-        for file_path in python_files:
-            logger.info(f"Processing: {file_path}")
-            self.visit_file(file_path)
-        
-        logger.info(f"Extracted {len(self.functions)} functions/methods")
-        return self.functions
+            logger.info(f"Found {len(python_files)} Python files")
+            
+            # Extract functions from each file
+            for file_path in python_files:
+                logger.info(f"Processing: {file_path}")
+                self.visit_file(file_path, target_year=year)
+            
+            logger.info(f"Extracted {len(self.functions)} functions/methods")
+            if self.skipped_functions_count > 0:
+                logger.info(f"Skipped {self.skipped_functions_count} functions that were not modified in target year")
+            return self.functions
+            
+        finally:
+            # Clean up temporary worktree if it was created
+            self.cleanup_temp_worktree()
+
+    def reset_state(self):
+        """Reset the extractor state for processing a new year."""
+        self.functions = []
+        self.skipped_functions_count = 0
+        # Don't reset repo_path as it will be set by setup_repository_for_year
 
 
 class DuckDBManager:
     """Manages DuckDB operations for storing function information."""
     
-    def __init__(self, db_path: str = "functions.db", drop_existing: bool = False):
+    def __init__(self, db_path: str = "functions.db", repo_name: str = "default", year: int = datetime.now().year, drop_existing: bool = False):
         self.db_path = db_path
+        self.repo_name = self._sanitize_table_name(repo_name)
+        self.year = year
         self.conn = duckdb.connect(db_path)
         self.create_tables(drop_existing)
     
+    def _sanitize_table_name(self, name: str) -> str:
+        """Sanitize table name to ensure it's valid for SQL."""
+        # Replace invalid characters with underscores
+        sanitized = ''.join(c if c.isalnum() or c == '_' else '_' for c in name.lower())
+        # Remove leading/trailing underscores and multiple consecutive underscores
+        sanitized = '_'.join(filter(None, sanitized.split('_')))
+        # Ensure it starts with a letter or underscore
+        if sanitized and not sanitized[0].isalpha() and sanitized[0] != '_':
+            sanitized = 'repo_' + sanitized
+        # Limit length to avoid issues
+        if len(sanitized) > 50:
+            sanitized = sanitized[:50]
+        return sanitized or 'default'
+    
+    def _get_table_name(self, base_name: str) -> str:
+        """Generate table name with repo and year prefix."""
+        return f"{self.repo_name}_{self.year}_{base_name}"
+    
+    def _get_index_name(self, base_name: str) -> str:
+        """Generate index name with repo and year prefix."""
+        return f"idx_{self.repo_name}_{self.year}_{base_name}"
+    
     def create_tables(self, drop_existing=False):
         """Create the necessary tables if they don't exist."""
+        functions_table = self._get_table_name("functions")
+        file_metadata_table = self._get_table_name("file_metadata")
+        sequence_name = f"{self.repo_name}_{self.year}_functions_id_seq"
+        
         if drop_existing:
             # Drop table and sequence if they exist to ensure schema is correct
-            self.conn.execute("DROP TABLE IF EXISTS functions")
-            self.conn.execute("DROP SEQUENCE IF EXISTS functions_id_seq")
+            self.conn.execute(f"DROP TABLE IF EXISTS {functions_table}")
+            self.conn.execute(f"DROP SEQUENCE IF EXISTS {sequence_name}")
         
         # Create sequence for auto-incrementing IDs
-        self.conn.execute("CREATE SEQUENCE IF NOT EXISTS functions_id_seq")
+        self.conn.execute(f"CREATE SEQUENCE IF NOT EXISTS {sequence_name}")
         
         # Main functions table
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS functions (
-                id INTEGER PRIMARY KEY DEFAULT nextval('functions_id_seq'),
+        self.conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS {functions_table} (
+                id INTEGER PRIMARY KEY DEFAULT nextval('{sequence_name}'),
                 name VARCHAR NOT NULL,
                 file_path VARCHAR NOT NULL,
                 line_number INTEGER NOT NULL,
@@ -304,18 +716,19 @@ class DuckDBManager:
                 return_annotation VARCHAR,
                 is_async BOOLEAN NOT NULL,
                 is_generator BOOLEAN NOT NULL,
-                file_hash VARCHAR NOT NULL,
-                function_hash VARCHAR NOT NULL,
+                commit_hash VARCHAR,
+                commit_date VARCHAR,
+                commit_author VARCHAR,
+                commit_message TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
         
         # File metadata table
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS file_metadata (
+        self.conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS {file_metadata_table} (
                 file_path VARCHAR PRIMARY KEY,
-                file_hash VARCHAR NOT NULL,
                 last_modified TIMESTAMP,
                 file_size INTEGER,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -324,18 +737,20 @@ class DuckDBManager:
         """)
         
         # Create indexes for better performance
-        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_functions_name ON functions(name)")
-        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_functions_file_path ON functions(file_path)")
-        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_functions_type ON functions(function_type)")
-        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_functions_hash ON functions(function_hash)")
+        self.conn.execute(f"CREATE INDEX IF NOT EXISTS {self._get_index_name('functions_name')} ON {functions_table}(name)")
+        self.conn.execute(f"CREATE INDEX IF NOT EXISTS {self._get_index_name('functions_file_path')} ON {functions_table}(file_path)")
+        self.conn.execute(f"CREATE INDEX IF NOT EXISTS {self._get_index_name('functions_type')} ON {functions_table}(function_type)")
+        self.conn.execute(f"CREATE INDEX IF NOT EXISTS {self._get_index_name('functions_commit_hash')} ON {functions_table}(commit_hash)")
         
-        logger.info("Database tables created successfully")
+        logger.info(f"Database tables created successfully for {self.repo_name}_{self.year}")
     
     def insert_functions(self, functions: List[FunctionInfo]):
         """Insert functions into the database."""
         if not functions:
             logger.warning("No functions to insert")
             return
+        
+        functions_table = self._get_table_name("functions")
         
         # Prepare data for insertion
         data = []
@@ -359,41 +774,47 @@ class DuckDBManager:
                 func.return_annotation,
                 func.is_async,
                 func.is_generator,
-                func.file_hash,
-                func.function_hash
+                func.commit_hash,
+                func.commit_date,
+                func.commit_author,
+                func.commit_message
             ))
         
         # Insert data
-        self.conn.executemany("""
-            INSERT INTO functions (
+        self.conn.executemany(f"""
+            INSERT INTO {functions_table} (
                 name, file_path, line_number, end_line, function_type, class_name,
                 docstring, signature, source_code, decorators, arguments, return_annotation,
-                is_async, is_generator, file_hash, function_hash
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                is_async, is_generator, commit_hash, commit_date,
+                commit_author, commit_message
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, data)
         
-        logger.info(f"Inserted {len(functions)} functions into database")
+        logger.info(f"Inserted {len(functions)} functions into {functions_table}")
     
-    def get_function_stats(self) -> Dict[str, Any]:
+    def get_function_stats(self, year: int = None) -> Dict[str, Any]:
         """Get statistics about stored functions."""
+        if year is None:
+            year = self.year
+        functions_table = self._get_table_name("functions")
         stats = {}
         
         # Total functions
-        result = self.conn.execute("SELECT COUNT(*) FROM functions").fetchone()
+        result = self.conn.execute(f"SELECT COUNT(*) FROM {functions_table}").fetchone()
         stats['total_functions'] = result[0] if result else 0
         
         # Functions by type
-        result = self.conn.execute("""
+        result = self.conn.execute(f"""
             SELECT function_type, COUNT(*) 
-            FROM functions 
+            FROM {functions_table} 
             GROUP BY function_type
         """).fetchall()
         stats['by_type'] = dict(result)
         
         # Functions by file
-        result = self.conn.execute("""
+        result = self.conn.execute(f"""
             SELECT file_path, COUNT(*) 
-            FROM functions 
+            FROM {functions_table} 
             GROUP BY file_path 
             ORDER BY COUNT(*) DESC 
             LIMIT 10
@@ -401,20 +822,32 @@ class DuckDBManager:
         stats['top_files'] = dict(result)
         
         # Unique files
-        result = self.conn.execute("SELECT COUNT(DISTINCT file_path) FROM functions").fetchone()
+        result = self.conn.execute(f"SELECT COUNT(DISTINCT file_path) FROM {functions_table}").fetchone()
         stats['unique_files'] = result[0] if result else 0
         
         return stats
     
-    def search_functions(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+    def search_functions(self, query: str = None, limit: int = 10) -> List[Dict[str, Any]]:
         """Search functions by name or content."""
-        result = self.conn.execute("""
-            SELECT name, file_path, line_number, function_type, class_name, docstring
-            FROM functions 
-            WHERE name ILIKE ? OR docstring ILIKE ? OR source_code ILIKE ?
+        functions_table = self._get_table_name("functions")
+        
+        where_conditions = []
+        params = []
+        
+        if query:
+            where_conditions.append("(name ILIKE ? OR docstring ILIKE ? OR source_code ILIKE ?)")
+            params.extend([f"%{query}%", f"%{query}%", f"%{query}%"])
+        
+        where_clause = " AND ".join(where_conditions) if where_conditions else "1=1"
+        
+        result = self.conn.execute(f"""
+            SELECT name, file_path, line_number, function_type, class_name, docstring, 
+                   commit_hash, commit_date, commit_author
+            FROM {functions_table} 
+            WHERE {where_clause}
             ORDER BY name
             LIMIT ?
-        """, [f"%{query}%", f"%{query}%", f"%{query}%", limit]).fetchall()
+        """, params + [limit]).fetchall()
         
         return [
             {
@@ -423,14 +856,138 @@ class DuckDBManager:
                 'line_number': row[2],
                 'function_type': row[3],
                 'class_name': row[4],
-                'docstring': row[5]
+                'docstring': row[5],
+                'commit_hash': row[6],
+                'commit_date': row[7],
+                'commit_author': row[8]
             }
             for row in result
         ]
     
+    def get_current_table_names(self) -> Dict[str, str]:
+        """Get the current table names being used."""
+        return {
+            'functions': self._get_table_name("functions"),
+            'file_metadata': self._get_table_name("file_metadata"),
+            'sequence': f"{self.repo_name}_{self.year}_functions_id_seq"
+        }
+    
+    def get_repository_info(self) -> Dict[str, Any]:
+        """Get information about the current repository and year."""
+        return {
+            'repo_name': self.repo_name,
+            'year': self.year,
+            'table_prefix': f"{self.repo_name}_{self.year}",
+            'database_path': self.db_path
+        }
+    
+    def tables_exist(self) -> bool:
+        """Check if tables exist for the current repo/year combination."""
+        functions_table = self._get_table_name("functions")
+        try:
+            result = self.conn.execute(f"SELECT COUNT(*) FROM {functions_table} LIMIT 1").fetchone()
+            return True
+        except:
+            return False
+    
+    def list_all_tables(self) -> List[str]:
+        """List all tables in the database."""
+        result = self.conn.execute("SHOW TABLES").fetchall()
+        return [row[0] for row in result] if result else []
+    
     def close(self):
         """Close the database connection."""
         self.conn.close()
+
+
+def handle_search_and_stats(db: DuckDBManager, search: str = None, stats: bool = False):
+    """Handle search and statistics operations."""
+    if stats:
+        stats_data = db.get_function_stats(db.year)
+        print("\n=== Function Statistics ===")
+        print(f"Total functions: {stats_data['total_functions']}")
+        print(f"Unique files: {stats_data['unique_files']}")
+        print(f"\nFunctions by type:")
+        for func_type, count in stats_data['by_type'].items():
+            print(f"  {func_type}: {count}")
+        print(f"\nTop files by function count:")
+        for file_path, count in stats_data['top_files'].items():
+            print(f"  {file_path}: {count}")
+    
+    if search:
+        results = db.search_functions(search)
+        print(f"\n=== Search Results for '{search}' ===")
+        for result in results:
+            print(f"\n{result['name']} ({result['function_type']})")
+            print(f"  File: {result['file_path']}:{result['line_number']}")
+            if result['class_name']:
+                print(f"  Class: {result['class_name']}")
+            if result['commit_hash']:
+                print(f"  Commit: {result['commit_hash'][:8]} by {result['commit_author']}")
+            if result['commit_date']:
+                print(f"  Date: {result['commit_date']}")
+            if result['docstring']:
+                print(f"  Docstring: {result['docstring'][:100]}...")
+
+
+def visit_repo(extractor: CodeExtractor, year: int, repo_name: str, db_path: str, drop_existing: bool = False) -> Dict[str, Any]:
+    """Process a single year of the repository and return statistics."""
+    logger.info(f"Processing year {year}...")
+    
+    # Show git repository information for this year
+    print(f"\n=== Processing Year {year} ===")
+    
+    # Extract functions for this specific year
+    functions = extractor.scan_repository(year)
+    
+    if not functions:
+        logger.warning(f"No functions found for year {year}")
+        return {
+            'year': year,
+            'total_functions': 0,
+            'unique_files': 0,
+            'by_type': {},
+            'success': False
+        }
+    
+    # Store in DuckDB for this year
+    db = DuckDBManager(db_path, repo_name=repo_name, year=year, drop_existing=drop_existing)
+    
+    # Show repository and table information for this year
+    repo_info = db.get_repository_info()
+    table_names = db.get_current_table_names()
+    
+    print(f"\n=== Repository Information for {year} ===")
+    print(f"Repository: {repo_info['repo_name']}")
+    print(f"Year: {repo_info['year']}")
+    print(f"Database: {repo_info['database_path']}")
+    print(f"Table prefix: {repo_info['table_prefix']}")
+    
+    print(f"\n=== Using Tables for {year} ===")
+    print(f"Functions table: {table_names['functions']}")
+    print(f"File metadata table: {table_names['file_metadata']}")
+    print(f"Sequence: {table_names['sequence']}")
+    
+    db.insert_functions(functions)
+    
+    # Get statistics for this year
+    stats_data = db.get_function_stats()
+    print(f"\n=== Year {year} Complete ===")
+    print(f"Total functions extracted: {stats_data['total_functions']}")
+    print(f"Files processed: {stats_data['unique_files']}")
+    print(f"Functions by type:")
+    for func_type, count in stats_data['by_type'].items():
+        print(f"  {func_type}: {count}")
+    
+    db.close()
+    
+    return {
+        'year': year,
+        'total_functions': stats_data['total_functions'],
+        'unique_files': stats_data['unique_files'],
+        'by_type': stats_data['by_type'],
+        'success': True
+    }
 
 
 def main():
@@ -458,36 +1015,15 @@ def main():
     db_path = config.get('database', {}).get('path', 'functions.db')
     drop_existing = config.get('database', {}).get('drop_existing', False)
     repo_path = config.get('repository', {}).get('path', '.')
+    repo_name = config.get('repository', {}).get('name', 'default')
+    year = config.get('repository', {}).get('year', datetime.now().year)
     search = config.get('repository', {}).get('search')
     stats = config.get('repository', {}).get('stats', False)
     
     if search or stats:
         # Just query the database
-        db = DuckDBManager(db_path, drop_existing=False)
-        
-        if stats:
-            stats_data = db.get_function_stats()
-            print("\n=== Function Statistics ===")
-            print(f"Total functions: {stats_data['total_functions']}")
-            print(f"Unique files: {stats_data['unique_files']}")
-            print(f"\nFunctions by type:")
-            for func_type, count in stats_data['by_type'].items():
-                print(f"  {func_type}: {count}")
-            print(f"\nTop files by function count:")
-            for file_path, count in stats_data['top_files'].items():
-                print(f"  {file_path}: {count}")
-        
-        if search:
-            results = db.search_functions(search)
-            print(f"\n=== Search Results for '{search}' ===")
-            for result in results:
-                print(f"\n{result['name']} ({result['function_type']})")
-                print(f"  File: {result['file_path']}:{result['line_number']}")
-                if result['class_name']:
-                    print(f"  Class: {result['class_name']}")
-                if result['docstring']:
-                    print(f"  Docstring: {result['docstring'][:100]}...")
-        
+        db = DuckDBManager(db_path, repo_name=repo_name, year=year, drop_existing=False)
+        handle_search_and_stats(db, search=search, stats=stats)
         db.close()
         return
     
@@ -495,26 +1031,92 @@ def main():
     logger.info("Starting function extraction...")
     
     extractor = CodeExtractor(repo_path)
-    functions = extractor.scan_repository()
     
-    if not functions:
-        logger.warning("No functions found in the repository")
-        return
+    # Verify this is a git repository (one-time check)
+    try:
+        result = subprocess.run(
+            ['git', 'rev-parse', '--git-dir'],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            check=False
+        )
+        if result.returncode != 0:
+            raise Exception("Not a git repository")
+    except (subprocess.SubprocessError, FileNotFoundError):
+        raise Exception("Git not available or not a git repository")
     
-    # Store in DuckDB
-    db = DuckDBManager(db_path, drop_existing=drop_existing)
-    db.insert_functions(functions)
+    # Get all years with commits
+    git_info = extractor.get_git_info()
+    first_year = git_info.get('first_commit_year')
+    last_year = git_info.get('last_commit_year')
     
-    # Show statistics
-    stats_data = db.get_function_stats()
-    print("\n=== Extraction Complete ===")
-    print(f"Total functions extracted: {stats_data['total_functions']}")
-    print(f"Files processed: {stats_data['unique_files']}")
-    print(f"\nFunctions by type:")
-    for func_type, count in stats_data['by_type'].items():
+    if not first_year or not last_year:
+        raise Exception("Could not determine repository commit years")
+    
+    print(f"\n=== Git Repository Information ===")
+    print(f"Repository: {repo_name}")
+    print(f"Path: {repo_path}")
+    print(f"First commit year: {first_year}")
+    print(f"Last commit year: {last_year}")
+    print(f"Years to process: {last_year - first_year + 1}")
+    
+    # Process each year
+    all_stats = []
+    successful_years = 0
+    total_functions = 0
+    
+    for current_year in range(first_year, last_year + 1):
+        try:
+            extractor.reset_state()  # Reset state for new year
+            extractor.setup_repository_for_year(current_year)
+            year_stats = visit_repo(extractor, current_year, repo_name, db_path, drop_existing)
+            all_stats.append(year_stats)
+            
+            if year_stats['success']:
+                successful_years += 1
+                total_functions += year_stats['total_functions']
+            
+        except Exception as e:
+            logger.error(f"Error processing year {current_year}: {e}")
+            all_stats.append({
+                'year': current_year,
+                'total_functions': 0,
+                'unique_files': 0,
+                'by_type': {},
+                'success': False,
+                'error': str(e)
+            })
+        finally:
+            # Ensure cleanup after each year
+            extractor.cleanup_temp_worktree()
+    
+    # Final cleanup to ensure no worktrees are left
+    extractor.cleanup_temp_worktree()
+    
+    # Show overall statistics
+    print(f"\n=== Overall Extraction Summary ===")
+    print(f"Years processed: {len(all_stats)}")
+    print(f"Successful years: {successful_years}")
+    print(f"Total functions across all years: {total_functions}")
+    
+    print(f"\n=== Year-by-Year Summary ===")
+    for year_stat in all_stats:
+        status = "✓" if year_stat['success'] else "✗"
+        error_msg = f" (Error: {year_stat.get('error', 'Unknown')})" if not year_stat['success'] else ""
+        print(f"{status} {year_stat['year']}: {year_stat['total_functions']} functions{error_msg}")
+    
+    # Show aggregated statistics by function type
+    print(f"\n=== Aggregated Functions by Type ===")
+    type_totals = {}
+    for year_stat in all_stats:
+        if year_stat['success']:
+            for func_type, count in year_stat['by_type'].items():
+                type_totals[func_type] = type_totals.get(func_type, 0) + count
+    
+    for func_type, count in sorted(type_totals.items()):
         print(f"  {func_type}: {count}")
     
-    db.close()
     logger.info("Function extraction completed successfully")
 
 
