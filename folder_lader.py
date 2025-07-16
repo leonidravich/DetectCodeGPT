@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Folder Lader - Repository Function and Method Scraper
+Folder Lader - Repository Function and Method Scraper (Optimized for Huge Repos)
 
 This script recursively scans a repository for Python files, extracts functions and methods
 using AST parsing, and stores them in DuckDB with comprehensive metadata.
+OPTIMIZED VERSION: Includes parallel processing, git caching, and batch operations.
 """
 
 import os
@@ -13,15 +14,185 @@ import subprocess
 import tempfile
 import shutil
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Dict, Any, Optional, Union, Set, Tuple
 from dataclasses import dataclass
 from datetime import datetime
 import logging
 import json
+import concurrent.futures
+import threading
+import time
+from functools import lru_cache
+from collections import defaultdict, deque
+import multiprocessing as mp
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+class GitCache:
+    """High-performance git operations cache for batch processing."""
+    
+    def __init__(self, repo_path: str):
+        self.repo_path = Path(repo_path)
+        self.file_blame_cache = {}
+        self.file_changes_cache = {}
+        self.commit_info_cache = {}
+        self.modified_files_cache = {}
+        self._lock = threading.Lock()
+    
+    def update_repo_path(self, new_repo_path: str):
+        """Update the repository path and clear all caches since they're now invalid."""
+        with self._lock:
+            self.repo_path = Path(new_repo_path)
+            # Clear all caches since they're based on the old repo path
+            self.file_blame_cache.clear()
+            self.file_changes_cache.clear()
+            self.commit_info_cache.clear()
+            self.modified_files_cache.clear()
+            logger.info(f"GitCache repo_path updated to: {new_repo_path}")
+        
+    def batch_get_modified_files_in_year(self, year: int) -> Set[str]:
+        """Get all files modified in a specific year in one git operation."""
+        cache_key = f"modified_files_{year}"
+        if cache_key in self.modified_files_cache:
+            return self.modified_files_cache[cache_key]
+            
+        try:
+            result = subprocess.run(
+                ['git', 'log', '--name-only', '--format=', f'--since={year}-01-01', f'--until={year}-12-31'],
+                cwd=self.repo_path,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            
+            modified_files = set()
+            for line in result.stdout.strip().split('\n'):
+                if line.strip() and line.endswith('.py'):
+                    modified_files.add(line.strip())
+            
+            self.modified_files_cache[cache_key] = modified_files
+            logger.info(f"Cached {len(modified_files)} modified Python files for year {year}")
+            return modified_files
+            
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Error getting modified files for {year}: {e}")
+            return set()
+    
+    def batch_get_file_blame(self, file_path: str) -> Dict[int, Dict[str, str]]:
+        """Get git blame for entire file in one operation."""
+        if file_path in self.file_blame_cache:
+            return self.file_blame_cache[file_path]
+            
+        try:
+            result = subprocess.run(
+                ['git', 'blame', '--porcelain', file_path],
+                cwd=self.repo_path,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            
+            blame_data = {}
+            current_line = 1
+            lines = result.stdout.split('\n')
+            i = 0
+            
+            while i < len(lines):
+                line = lines[i]
+                if line and len(line.split()) > 0:
+                    commit_hash = line.split()[0]
+                    if len(commit_hash) == 40:  # Full commit hash
+                        # Parse porcelain format
+                        commit_info = {'commit_hash': commit_hash}
+                        i += 1
+                        
+                        # Parse additional info
+                        while i < len(lines) and not lines[i].startswith('\t'):
+                            if lines[i].startswith('author '):
+                                commit_info['commit_author'] = lines[i][7:]
+                            elif lines[i].startswith('author-time '):
+                                timestamp = int(lines[i][12:])
+                                commit_info['commit_date'] = datetime.fromtimestamp(timestamp).isoformat()
+                            elif lines[i].startswith('summary '):
+                                commit_info['commit_message'] = lines[i][8:]
+                            i += 1
+                        
+                        blame_data[current_line] = commit_info
+                        current_line += 1
+                i += 1
+            
+            with self._lock:
+                self.file_blame_cache[file_path] = blame_data
+            return blame_data
+            
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"Error getting blame for {file_path}: {e}")
+            return {}
+    
+    def get_line_commit_info(self, file_path: str, line_number: int) -> Dict[str, str]:
+        """Get commit info for a specific line using cached blame data."""
+        blame_data = self.batch_get_file_blame(file_path)
+        return blame_data.get(line_number, {})
+    
+    def is_file_modified_in_year(self, file_path: str, year: int) -> bool:
+        """Check if file was modified in year using cached data."""
+        modified_files = self.batch_get_modified_files_in_year(year)
+        return file_path in modified_files
+    
+    def clear_cache(self):
+        """Clear all cached data."""
+        with self._lock:
+            self.file_blame_cache.clear()
+            self.file_changes_cache.clear()
+            self.commit_info_cache.clear()
+            self.modified_files_cache.clear()
+
+
+class PerformanceMetrics:
+    """Track performance metrics for optimization analysis."""
+    
+    def __init__(self):
+        self.start_time = time.time()
+        self.file_count = 0
+        self.function_count = 0
+        self.git_ops_count = 0
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.processing_times = deque(maxlen=1000)
+        
+    def record_file_processed(self, processing_time: float):
+        self.file_count += 1
+        self.processing_times.append(processing_time)
+        
+    def record_function_found(self):
+        self.function_count += 1
+        
+    def record_git_operation(self):
+        self.git_ops_count += 1
+        
+    def record_cache_hit(self):
+        self.cache_hits += 1
+        
+    def record_cache_miss(self):
+        self.cache_misses += 1
+        
+    def get_summary(self) -> Dict[str, Any]:
+        elapsed = time.time() - self.start_time
+        avg_file_time = sum(self.processing_times) / len(self.processing_times) if self.processing_times else 0
+        
+        return {
+            'elapsed_time': elapsed,
+            'files_processed': self.file_count,
+            'functions_found': self.function_count,
+            'git_operations': self.git_ops_count,
+            'cache_hit_ratio': self.cache_hits / (self.cache_hits + self.cache_misses) if (self.cache_hits + self.cache_misses) > 0 else 0,
+            'avg_file_processing_time': avg_file_time,
+            'files_per_second': self.file_count / elapsed if elapsed > 0 else 0,
+            'functions_per_second': self.function_count / elapsed if elapsed > 0 else 0
+        }
 
 
 @dataclass
@@ -51,17 +222,21 @@ class FunctionInfo:
 class CodeExtractor:
     """Extracts functions and methods from Python files using AST parsing."""
     
-    def __init__(self, repo_path: str = "."):
+    def __init__(self, repo_path: str = ".", max_workers: int = None):
         self.repo_path = Path(repo_path).resolve()
         self.original_repo_path = self.repo_path  # Store the original path
         self.functions = []
         self.original_commit = None
         self.temp_worktree = None
         self.skipped_functions_count = 0  # Statistics for skipped functions
+        self.max_workers = max_workers or min(32, (os.cpu_count() or 1) + 4)
+        self.git_cache = GitCache(str(self.original_repo_path))
+        self.metrics = PerformanceMetrics()
+        self._ast_cache = {}  # Cache parsed ASTs
+        self._file_content_cache = {}  # Cache file contents
         
     def get_last_commit_of_year(self, year: int) -> Optional[str]:
         """Get the last commit hash of a specific year."""
-        logger.info(f"LEO Getting last commit of {self.original_repo_path}")
         try:
             # Get the last commit of the specified year
             result = subprocess.run(
@@ -201,6 +376,10 @@ class CodeExtractor:
                 logger.error(f"Error during worktree cleanup: {e}")
             finally:
                 self.temp_worktree = None
+                # Reset repo_path back to original 
+                self.repo_path = self.original_repo_path
+                # Reset GitCache repo_path back to original
+                self.git_cache.update_repo_path(str(self.original_repo_path))
                 logger.info("Worktree cleanup completed")
     
     def cleanup_existing_worktrees(self):
@@ -264,6 +443,7 @@ class CodeExtractor:
         
         # Update repo_path to point to the temporary worktree
         self.repo_path = Path(self.temp_worktree)
+        self.git_cache.update_repo_path(str(self.repo_path)) # Update GitCache's repo_path
         logger.info(f"Repository set up for year {year} at commit {target_commit[:8]}")
         return True
     
@@ -322,37 +502,18 @@ class CodeExtractor:
     def get_file_commit_info(self, file_path: str, line_number: int) -> Dict[str, Any]:
         """Get commit information for a specific line in a file."""
         try:
-            # Get the commit that introduced this line
-            result = subprocess.run(
-                ['git', 'blame', '-L', f'{line_number},{line_number}', '--porcelain', file_path],
-                cwd=self.repo_path,
-                capture_output=True,
-                text=True,
-                check=True
-            )
+            # Use cached git blame data
+            relative_path = os.path.relpath(file_path, self.repo_path)
+            commit_info = self.git_cache.get_line_commit_info(relative_path, line_number)
             
-            lines = result.stdout.strip().split('\n')
-            if not lines or not lines[0]:
+            if commit_info:
+                self.metrics.record_cache_hit()
+                return commit_info
+            else:
+                self.metrics.record_cache_miss()
                 return {}
             
-            # Parse git blame output
-            commit_hash = lines[0].split()[0]
-            
-            # Extract additional info from porcelain format
-            commit_info = {'commit_hash': commit_hash}
-            
-            for line in lines[1:]:
-                if line.startswith('author '):
-                    commit_info['commit_author'] = line[7:]
-                elif line.startswith('author-time '):
-                    timestamp = int(line[12:])
-                    commit_info['commit_date'] = datetime.fromtimestamp(timestamp).isoformat()
-                elif line.startswith('summary '):
-                    commit_info['commit_message'] = line[8:]
-            
-            return commit_info
-            
-        except subprocess.CalledProcessError as e:
+        except Exception as e:
             logger.warning(f"Error getting commit info for {file_path}:{line_number}: {e}")
             return {}
     
@@ -388,18 +549,35 @@ class CodeExtractor:
     
     def is_function_modified_in_year(self, file_path: str, start_line: int, end_line: int, year: int) -> bool:
         """Check if a function (line range) was modified in the specified year."""
+        # First check if file was modified at all in the year (cached operation)
+        relative_path = os.path.relpath(file_path, self.repo_path)
+        # Normalize path separators to forward slashes for git compatibility
+        relative_path_normalized = relative_path.replace(os.sep, '/')
+        
+        if not self.git_cache.is_file_modified_in_year(relative_path_normalized, year):
+            self.metrics.record_cache_hit()
+            logger.debug(f"FILTERED: File {relative_path_normalized} was not modified in {year}")
+            return False
+        
+        self.metrics.record_cache_miss()
         try:
             # Get commits that modified this line range in the specified year
+            # Use original_repo_path to ensure we have complete git history
+            # Use normalized path for git command
             result = subprocess.run(
                 ['git', 'log', '--format=%H', f'--since={year}-01-01', f'--until={year}-12-31', 
-                 '-L', f'{start_line},{end_line}:{file_path}'],
+                 '-L', f'{start_line},{end_line}:{relative_path_normalized}'],
                 cwd=self.repo_path,
                 capture_output=True,
                 text=True,
                 check=True
             )
             
-            return bool(result.stdout.strip())
+            self.metrics.record_git_operation()
+            was_modified = bool(result.stdout.strip())
+            if not was_modified:
+                logger.debug(f"FILTERED: Function in {relative_path_normalized}:{start_line}-{end_line} was not modified in {year}")
+            return was_modified
             
         except subprocess.CalledProcessError as e:
             logger.warning(f"Error checking if function was modified in {year}: {e}")
@@ -485,9 +663,17 @@ class CodeExtractor:
     
     def get_source_code(self, file_path: str, start_line: int, end_line: int) -> str:
         """Extract source code for a specific line range."""
-        with open(file_path, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-            return ''.join(lines[start_line-1:end_line])
+        # Use cached file content if available
+        if file_path not in self._file_content_cache:
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    self._file_content_cache[file_path] = f.readlines()
+            except (UnicodeDecodeError, IOError) as e:
+                logger.warning(f"Error reading file {file_path}: {e}")
+                return ""
+        
+        lines = self._file_content_cache[file_path]
+        return ''.join(lines[start_line-1:end_line])
     
     def visit_function(self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef], 
                       file_path: str, class_name: Optional[str] = None, target_year: Optional[int] = None) -> Optional[FunctionInfo]:
@@ -502,14 +688,24 @@ class CodeExtractor:
                 # If we're filtering by year and function wasn't modified, skip it immediately
                 if not was_modified_in_year:
                     self.skipped_functions_count += 1
+                    relative_path = os.path.relpath(file_path, self.repo_path).replace(os.sep, '/')
+                    func_name = f"{class_name}.{node.name}" if class_name else node.name
+                    logger.debug(f"SKIPPED: {func_name} in {relative_path}:{node.lineno} (not modified in {target_year})")
                     return None
+                else:
+                    relative_path = os.path.relpath(file_path, self.repo_path).replace(os.sep, '/')
+                    func_name = f"{class_name}.{node.name}" if class_name else node.name
+                    logger.debug(f"PROCESSING: {func_name} in {relative_path}:{node.lineno} (modified in {target_year})")
             except Exception as e:
                 logger.warning(f"Error checking if function {node.name} was modified in {file_path}: {e}")
                 # Continue processing if we can't determine modification status
         
+        # Record function found
+        self.metrics.record_function_found()
+        
         # Determine function type
+        decorators = self.get_decorators(node)
         if class_name:
-            decorators = self.get_decorators(node)
             if 'classmethod' in decorators:
                 function_type = 'class_method'
             elif 'staticmethod' in decorators:
@@ -519,21 +715,18 @@ class CodeExtractor:
         else:
             function_type = 'function'
         
-        # Extract information
+        # Extract information efficiently
         docstring = self.extract_docstring(node)
-        decorators = self.get_decorators(node)
         arguments = self.get_arguments(node)
         return_annotation = self.get_return_annotation(node)
         is_async = isinstance(node, ast.AsyncFunctionDef)
         is_generator = isinstance(node, ast.FunctionDef) and node.returns is None
         
-        # Get source code
+        # Get source code using cache
         source_code = self.get_source_code(file_path, node.lineno, node.end_lineno)
         
-        # Get git commit information
+        # Get git commit information using cache
         commit_info = {}
-        was_modified_in_year = True  # Default to True since we already checked above
-        
         try:
             # Get commit info for the function's first line
             commit_info = self.get_file_commit_info(file_path, node.lineno)
@@ -573,39 +766,64 @@ class CodeExtractor:
                     logger.warning(f"Error processing method {item.name} in class {node.name} in {file_path}: {e}")
                     continue
     
-    def visit_file(self, file_path: str, target_year: Optional[int] = None):
+    def visit_class_optimized(self, node: ast.ClassDef, file_path: str, target_year: Optional[int] = None) -> List[FunctionInfo]:
+        """Visit class and extract its methods - optimized version that returns functions."""
+        class_functions = []
+        for item in node.body:
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                try:
+                    function_info = self.visit_function(item, file_path, node.name, target_year)
+                    if function_info:
+                        class_functions.append(function_info)
+                except Exception as e:
+                    logger.warning(f"Error processing method {item.name} in class {node.name} in {file_path}: {e}")
+                    continue
+        return class_functions
+    
+    def visit_file(self, file_path: str, target_year: Optional[int] = None) -> List[FunctionInfo]:
         """Parse a Python file and extract all functions and methods."""
+        file_start_time = time.time()
+        file_functions = []
+        
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
+            # Use cached AST if available
+            if file_path not in self._ast_cache:
+                if file_path not in self._file_content_cache:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                        self._file_content_cache[file_path] = content.splitlines(keepends=True)
+                else:
+                    content = ''.join(self._file_content_cache[file_path])
+                
+                self._ast_cache[file_path] = ast.parse(content)
             
-            tree = ast.parse(content)
+            tree = self._ast_cache[file_path]
             
-            for node in ast.walk(tree):
+            # More efficient node processing - avoid multiple ast.walk calls
+            for node in tree.body:
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    # Check if function is inside a class
-                    parent_class = None
-                    for parent in ast.walk(tree):
-                        if (isinstance(parent, ast.ClassDef) and 
-                            node in parent.body):
-                            parent_class = parent.name
-                            break
-                    
-                    if not parent_class:  # Top-level function
-                        try:
-                            function_info = self.visit_function(node, file_path, target_year=target_year)
-                            if function_info:  # Only append if function_info is not None (i.e., not filtered out)
-                                self.functions.append(function_info)
-                        except Exception as e:
-                            logger.warning(f"Error processing function {node.name} in {file_path}: {e}")
-                            continue
+                    # Top-level function
+                    try:
+                        function_info = self.visit_function(node, file_path, target_year=target_year)
+                        if function_info:
+                            file_functions.append(function_info)
+                    except Exception as e:
+                        logger.warning(f"Error processing function {node.name} in {file_path}: {e}")
+                        continue
                 
                 elif isinstance(node, ast.ClassDef):
                     try:
-                        self.visit_class(node, file_path, target_year)
+                        class_functions = self.visit_class_optimized(node, file_path, target_year)
+                        file_functions.extend(class_functions)
                     except Exception as e:
                         logger.warning(f"Error processing class {node.name} in {file_path}: {e}")
                         continue
+            
+            # Record performance metrics
+            processing_time = time.time() - file_start_time
+            self.metrics.record_file_processed(processing_time)
+            
+            return file_functions
                     
         except SyntaxError as e:
             logger.warning(f"Syntax error in {file_path}: {e}")
@@ -613,13 +831,15 @@ class CodeExtractor:
             logger.warning(f"Encoding error in {file_path}: {e}")
         except Exception as e:
             logger.error(f"Error parsing {file_path}: {e}")
+        
+        return []
     
     def scan_repository(self, year: Optional[int] = None) -> List[FunctionInfo]:
         """Recursively scan the repository for Python files and extract functions."""
-        logger.info(f"Scanning repository: {self.repo_path}")
+        logger.info(f"Scanning repository: {self.repo_path} with {self.max_workers} workers")
         
         try:
-            # Find all Python files
+            # Find all Python files efficiently
             python_files = []
             for root, dirs, files in os.walk(self.repo_path):
                 # Skip common directories to ignore
@@ -631,14 +851,57 @@ class CodeExtractor:
             
             logger.info(f"Found {len(python_files)} Python files")
             
-            # Extract functions from each file
-            for file_path in python_files:
-                logger.info(f"Processing: {file_path}")
-                self.visit_file(file_path, target_year=year)
+            # If filtering by year, pre-cache modified files for the entire year
+            if year:
+                logger.info(f"Pre-caching modified files for year {year}...")
+                self.git_cache.batch_get_modified_files_in_year(year)
             
+            # Process files in parallel
+            logger.info(f"Processing files with {self.max_workers} parallel workers...")
+            all_functions = []
+            
+            if len(python_files) < 10:  # For small repos, don't use parallel processing
+                for file_path in python_files:
+                    logger.debug(f"Processing: {file_path}")
+                    file_functions = self.visit_file(file_path, target_year=year)
+                    all_functions.extend(file_functions)
+            else:
+                # Use ThreadPoolExecutor for I/O bound tasks like file reading and git operations
+                with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                    # Submit all file processing tasks
+                    future_to_file = {
+                        executor.submit(self.visit_file, file_path, year): file_path 
+                        for file_path in python_files
+                    }
+                    
+                    # Collect results as they complete
+                    for future in concurrent.futures.as_completed(future_to_file):
+                        file_path = future_to_file[future]
+                        try:
+                            file_functions = future.result()
+                            all_functions.extend(file_functions)
+                            if len(all_functions) % 100 == 0:  # Progress indicator
+                                logger.info(f"Processed {len([f for f in future_to_file if f.done()])} files, found {len(all_functions)} functions so far...")
+                        except Exception as e:
+                            logger.error(f"Error processing file {file_path}: {e}")
+            
+            # Update main functions list
+            self.functions = all_functions
+            
+            # Show performance metrics
+            metrics = self.metrics.get_summary()
+            logger.info(f"=== Performance Summary ===")
             logger.info(f"Extracted {len(self.functions)} functions/methods")
+            logger.info(f"Files processed: {metrics['files_processed']}")
+            logger.info(f"Processing time: {metrics['elapsed_time']:.2f}s")
+            logger.info(f"Files per second: {metrics['files_per_second']:.2f}")
+            logger.info(f"Functions per second: {metrics['functions_per_second']:.2f}")
+            logger.info(f"Cache hit ratio: {metrics['cache_hit_ratio']:.2%}")
+            logger.info(f"Git operations: {metrics['git_operations']}")
+            
             if self.skipped_functions_count > 0:
                 logger.info(f"Skipped {self.skipped_functions_count} functions that were not modified in target year")
+            
             return self.functions
             
         finally:
@@ -649,7 +912,21 @@ class CodeExtractor:
         """Reset the extractor state for processing a new year."""
         self.functions = []
         self.skipped_functions_count = 0
+        # Clear caches to free memory
+        self._ast_cache.clear()
+        self._file_content_cache.clear()
+        self.git_cache.clear_cache()
+        self.metrics = PerformanceMetrics()
         # Don't reset repo_path as it will be set by setup_repository_for_year
+    
+    def get_memory_usage(self) -> Dict[str, int]:
+        """Get current memory usage of caches."""
+        return {
+            'ast_cache_entries': len(self._ast_cache),
+            'file_content_cache_entries': len(self._file_content_cache),
+            'git_blame_cache_entries': len(self.git_cache.file_blame_cache),
+            'git_modified_files_cache_entries': len(self.git_cache.modified_files_cache)
+        }
 
 
 class DuckDBManager:
@@ -659,7 +936,13 @@ class DuckDBManager:
         self.db_path = db_path
         self.repo_name = self._sanitize_table_name(repo_name)
         self.year = year
+        
+        # Optimize DuckDB connection for performance
         self.conn = duckdb.connect(db_path)
+        self.conn.execute("PRAGMA threads=4")  # Use multiple threads
+        self.conn.execute("PRAGMA memory_limit='2GB'")  # Set memory limit
+        self.conn.execute("PRAGMA temp_directory='/tmp'")  # Use fast temp storage
+        
         self.create_tables(drop_existing)
     
     def _sanitize_table_name(self, name: str) -> str:
@@ -744,53 +1027,73 @@ class DuckDBManager:
         
         logger.info(f"Database tables created successfully for {self.repo_name}_{self.year}")
     
-    def insert_functions(self, functions: List[FunctionInfo]):
-        """Insert functions into the database."""
+    def insert_functions(self, functions: List[FunctionInfo], batch_size: int = 1000):
+        """Insert functions into the database with optimized batch processing."""
         if not functions:
             logger.warning("No functions to insert")
             return
         
         functions_table = self._get_table_name("functions")
         
-        # Prepare data for insertion
-        data = []
-        for func in functions:
-            # Convert lists to JSON strings for storage
-            decorators_str = json.dumps(func.decorators) if func.decorators else None
-            arguments_str = json.dumps(func.arguments) if func.arguments else None
+        logger.info(f"Inserting {len(functions)} functions in batches of {batch_size}")
+        
+        # Begin transaction for better performance
+        self.conn.begin()
+        
+        try:
+            # Process in batches to manage memory
+            for i in range(0, len(functions), batch_size):
+                batch = functions[i:i + batch_size]
+                
+                # Prepare data for insertion
+                data = []
+                for func in batch:
+                    # Convert lists to JSON strings for storage
+                    decorators_str = json.dumps(func.decorators) if func.decorators else None
+                    arguments_str = json.dumps(func.arguments) if func.arguments else None
+                    
+                    data.append((
+                        func.name,
+                        func.file_path,
+                        func.line_number,
+                        func.end_line,
+                        func.function_type,
+                        func.class_name,
+                        func.docstring,
+                        func.signature,
+                        func.source_code,
+                        decorators_str,
+                        arguments_str,
+                        func.return_annotation,
+                        func.is_async,
+                        func.is_generator,
+                        func.commit_hash,
+                        func.commit_date,
+                        func.commit_author,
+                        func.commit_message
+                    ))
+                
+                # Insert batch
+                self.conn.executemany(f"""
+                    INSERT INTO {functions_table} (
+                        name, file_path, line_number, end_line, function_type, class_name,
+                        docstring, signature, source_code, decorators, arguments, return_annotation,
+                        is_async, is_generator, commit_hash, commit_date,
+                        commit_author, commit_message
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, data)
+                
+                logger.debug(f"Inserted batch {i//batch_size + 1}/{(len(functions) + batch_size - 1)//batch_size}")
             
-            data.append((
-                func.name,
-                func.file_path,
-                func.line_number,
-                func.end_line,
-                func.function_type,
-                func.class_name,
-                func.docstring,
-                func.signature,
-                func.source_code,
-                decorators_str,
-                arguments_str,
-                func.return_annotation,
-                func.is_async,
-                func.is_generator,
-                func.commit_hash,
-                func.commit_date,
-                func.commit_author,
-                func.commit_message
-            ))
-        
-        # Insert data
-        self.conn.executemany(f"""
-            INSERT INTO {functions_table} (
-                name, file_path, line_number, end_line, function_type, class_name,
-                docstring, signature, source_code, decorators, arguments, return_annotation,
-                is_async, is_generator, commit_hash, commit_date,
-                commit_author, commit_message
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, data)
-        
-        logger.info(f"Inserted {len(functions)} functions into {functions_table}")
+            # Commit transaction
+            self.conn.commit()
+            logger.info(f"Successfully inserted {len(functions)} functions into {functions_table}")
+            
+        except Exception as e:
+            # Rollback on error
+            self.conn.rollback()
+            logger.error(f"Error inserting functions: {e}")
+            raise
     
     def get_function_stats(self, year: int = None) -> Dict[str, Any]:
         """Get statistics about stored functions."""
@@ -937,8 +1240,14 @@ def visit_repo(extractor: CodeExtractor, year: int, repo_name: str, db_path: str
     # Show git repository information for this year
     print(f"\n=== Processing Year {year} ===")
     
+    # Show memory usage before processing
+    memory_usage = extractor.get_memory_usage()
+    logger.info(f"Cache entries before processing: {memory_usage}")
+    
     # Extract functions for this specific year
+    start_time = time.time()
     functions = extractor.scan_repository(year)
+    processing_time = time.time() - start_time
     
     if not functions:
         logger.warning(f"No functions found for year {year}")
@@ -947,6 +1256,7 @@ def visit_repo(extractor: CodeExtractor, year: int, repo_name: str, db_path: str
             'total_functions': 0,
             'unique_files': 0,
             'by_type': {},
+            'processing_time': processing_time,
             'success': False
         }
     
@@ -968,16 +1278,25 @@ def visit_repo(extractor: CodeExtractor, year: int, repo_name: str, db_path: str
     print(f"File metadata table: {table_names['file_metadata']}")
     print(f"Sequence: {table_names['sequence']}")
     
-    db.insert_functions(functions)
+    # Insert with optimized batch processing
+    insert_start = time.time()
+    db.insert_functions(functions, batch_size=2000)  # Larger batches for better performance
+    insert_time = time.time() - insert_start
     
     # Get statistics for this year
     stats_data = db.get_function_stats()
     print(f"\n=== Year {year} Complete ===")
     print(f"Total functions extracted: {stats_data['total_functions']}")
     print(f"Files processed: {stats_data['unique_files']}")
+    print(f"Processing time: {processing_time:.2f}s")
+    print(f"Database insert time: {insert_time:.2f}s")
     print(f"Functions by type:")
     for func_type, count in stats_data['by_type'].items():
         print(f"  {func_type}: {count}")
+    
+    # Show final memory usage
+    final_memory_usage = extractor.get_memory_usage()
+    logger.info(f"Cache entries after processing: {final_memory_usage}")
     
     db.close()
     
@@ -986,6 +1305,8 @@ def visit_repo(extractor: CodeExtractor, year: int, repo_name: str, db_path: str
         'total_functions': stats_data['total_functions'],
         'unique_files': stats_data['unique_files'],
         'by_type': stats_data['by_type'],
+        'processing_time': processing_time,
+        'insert_time': insert_time,
         'success': True
     }
 
@@ -1028,9 +1349,19 @@ def main():
         return
     
     # Extract functions from repository
-    logger.info("Starting function extraction...")
+    logger.info("Starting optimized function extraction...")
     
-    extractor = CodeExtractor(repo_path)
+    # Determine optimal worker count based on repository size
+    try:
+        # Quick estimate of repository size
+        python_file_count = sum(1 for root, dirs, files in os.walk(repo_path) 
+                              for file in files if file.endswith('.py'))
+        optimal_workers = min(32, max(4, python_file_count // 50))  # 1 worker per 50 files, min 4, max 32
+        logger.info(f"Estimated {python_file_count} Python files, using {optimal_workers} workers")
+    except:
+        optimal_workers = 8  # Default fallback
+    
+    extractor = CodeExtractor(repo_path, max_workers=optimal_workers)
     
     # Verify this is a git repository (one-time check)
     try:

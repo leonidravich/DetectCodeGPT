@@ -4,7 +4,7 @@
 # Database Configuration
 database:
   path: "functions.db"
-  drop_existing: false
+  drop_existing: true
   repo_name: "detectcodegpt"  # Repository name to analyze
   year: 2025  # Year to analyze (null = auto-detect first available year)
 
