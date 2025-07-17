@@ -125,4 +125,8 @@ def get_ranks_fast(
         )
         vals = logrank_mean if log else rank_mean
         out.extend(vals.tolist())
+        
+        # Clear GPU memory after each batch to prevent accumulation
+        if dev == 'cuda':
+            torch.cuda.empty_cache()
     return out 

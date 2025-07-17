@@ -83,6 +83,184 @@ class FunctionLoader:
         """Generate table name with repo and year prefix."""
         return f"{self.repo_name}_{self.year}_{base_name}"
     
+    def add_score_columns_if_missing(self) -> bool:
+        """Add AI detection score columns to existing tables if they don't exist."""
+        functions_table = self._get_table_name("functions")
+        
+        try:
+            # Check if table exists
+            result = self.conn.execute(f"SELECT COUNT(*) FROM {functions_table} LIMIT 1").fetchone()
+        except:
+            logger.error(f"Table {functions_table} does not exist")
+            return False
+        
+        try:
+            # Check if score columns already exist
+            result = self.conn.execute(f"PRAGMA table_info({functions_table})").fetchall()
+            existing_columns = [row[1] for row in result]
+            
+            columns_to_add = [
+                ('original_rank', 'REAL'),
+                ('perturbed_rank_mean', 'REAL'),
+                ('detectcodegpt_score', 'REAL'),
+                ('scores_updated_at', 'TIMESTAMP')
+            ]
+            
+            added_columns = []
+            for col_name, col_type in columns_to_add:
+                if col_name not in existing_columns:
+                    self.conn.execute(f"ALTER TABLE {functions_table} ADD COLUMN {col_name} {col_type}")
+                    added_columns.append(col_name)
+            
+            if added_columns:
+                logger.info(f"Added score columns to {functions_table}: {added_columns}")
+            else:
+                logger.info(f"Score columns already exist in {functions_table}")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error adding score columns to {functions_table}: {e}")
+            return False
+    
+    def update_function_scores(self, scores_data: List[Dict[str, Any]], batch_size: int = 1000) -> bool:
+        """Update functions with their AI detection scores."""
+        if not scores_data:
+            logger.warning("No scores data to update")
+            return False
+        
+        functions_table = self._get_table_name("functions")
+        
+        # Ensure score columns exist
+        if not self.add_score_columns_if_missing():
+            return False
+        
+        logger.info(f"Updating {len(scores_data)} function scores in batches of {batch_size}")
+        
+        # Begin transaction for better performance
+        self.conn.begin()
+        
+        try:
+            # Process in batches
+            for i in range(0, len(scores_data), batch_size):
+                batch = scores_data[i:i + batch_size]
+                
+                # Prepare data for update
+                update_data = []
+                for score_data in batch:
+                    update_data.append((
+                        score_data['original_rank'],
+                        score_data['perturbed_rank_mean'],
+                        score_data['detectcodegpt_score'],
+                        score_data['function_id']
+                    ))
+                
+                # Update batch
+                self.conn.executemany(f"""
+                    UPDATE {functions_table} 
+                    SET original_rank = ?, 
+                        perturbed_rank_mean = ?, 
+                        detectcodegpt_score = ?,
+                        scores_updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                """, update_data)
+                
+                logger.debug(f"Updated batch {i//batch_size + 1}/{(len(scores_data) + batch_size - 1)//batch_size}")
+            
+            # Commit transaction
+            self.conn.commit()
+            logger.info(f"Successfully updated {len(scores_data)} function scores in {functions_table}")
+            return True
+            
+        except Exception as e:
+            # Rollback on error
+            self.conn.rollback()
+            logger.error(f"Error updating function scores: {e}")
+            return False
+    
+    def get_functions_with_scores(self, limit: Optional[int] = None, 
+                                 function_type: Optional[str] = None,
+                                 file_pattern: Optional[str] = None,
+                                 has_scores: Optional[bool] = None) -> List[Dict[str, Any]]:
+        """Load functions from database with optional filters, including score data."""
+        
+        functions_table = self._get_table_name("functions")
+        
+        # Check if table exists
+        try:
+            result = self.conn.execute(f"SELECT COUNT(*) FROM {functions_table} LIMIT 1").fetchone()
+        except:
+            logger.error(f"Table {functions_table} does not exist")
+            return []
+        
+        # Check if score columns exist
+        try:
+            result = self.conn.execute(f"PRAGMA table_info({functions_table})").fetchall()
+            existing_columns = [row[1] for row in result]
+            has_score_columns = all(col in existing_columns for col in ['original_rank', 'perturbed_rank_mean', 'detectcodegpt_score'])
+        except:
+            has_score_columns = False
+        
+        # Build query with score columns if available
+        if has_score_columns:
+            query = f"""SELECT id, name, file_path, line_number, function_type, class_name, source_code,
+                              original_rank, perturbed_rank_mean, detectcodegpt_score, scores_updated_at 
+                       FROM {functions_table}"""
+        else:
+            query = f"SELECT id, name, file_path, line_number, function_type, class_name, source_code FROM {functions_table}"
+        
+        conditions = []
+        params = []
+        
+        if function_type:
+            conditions.append("function_type = ?")
+            params.append(function_type)
+        
+        if file_pattern:
+            conditions.append("file_path ILIKE ?")
+            params.append(f"%{file_pattern}%")
+        
+        if has_scores is not None and has_score_columns:
+            if has_scores:
+                conditions.append("original_rank IS NOT NULL")
+            else:
+                conditions.append("original_rank IS NULL")
+        
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        
+        query += " ORDER BY id"
+        
+        if limit:
+            query += f" LIMIT {limit}"
+        
+        result = self.conn.execute(query, params).fetchall()
+        
+        functions = []
+        for row in result:
+            func_data = {
+                'id': row[0],
+                'name': row[1],
+                'file_path': row[2],
+                'line_number': row[3],
+                'function_type': row[4],
+                'class_name': row[5],
+                'source_code': row[6]
+            }
+            
+            # Add score data if columns exist
+            if has_score_columns and len(row) > 7:
+                func_data.update({
+                    'original_rank': row[7],
+                    'perturbed_rank_mean': row[8],
+                    'detectcodegpt_score': row[9],
+                    'scores_updated_at': row[10]
+                })
+            
+            functions.append(func_data)
+        
+        return functions
+    
     def get_functions(self, limit: Optional[int] = None, 
                      function_type: Optional[str] = None,
                      file_pattern: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -253,6 +431,113 @@ class FunctionLoader:
             'years': years,
             'year_stats': all_stats
         }
+    
+    def get_repo_year_summary(self, include_scores: bool = True) -> Dict[str, Any]:
+        """Get summary statistics for current repo/year including AI detection scores."""
+        functions_table = self._get_table_name("functions")
+        summary = {
+            'repository': self.repo_name,
+            'year': self.year,
+            'table_name': functions_table
+        }
+        
+        try:
+            # Basic function statistics
+            stats = self.get_function_stats()
+            summary.update(stats)
+            
+            if include_scores:
+                # Check if score columns exist
+                result = self.conn.execute(f"PRAGMA table_info({functions_table})").fetchall()
+                existing_columns = [row[1] for row in result]
+                has_score_columns = all(col in existing_columns for col in ['original_rank', 'perturbed_rank_mean', 'detectcodegpt_score'])
+                
+                if has_score_columns:
+                    # Score statistics
+                    result = self.conn.execute(f"""
+                        SELECT 
+                            COUNT(*) as total_with_scores,
+                            COUNT(CASE WHEN original_rank IS NOT NULL THEN 1 END) as functions_with_scores,
+                            AVG(original_rank) as avg_original_rank,
+                            AVG(perturbed_rank_mean) as avg_perturbed_rank,
+                            AVG(detectcodegpt_score) as avg_detectcodegpt_score,
+                            MIN(detectcodegpt_score) as min_detectcodegpt_score,
+                            MAX(detectcodegpt_score) as max_detectcodegpt_score,
+                            STDDEV(detectcodegpt_score) as std_detectcodegpt_score
+                        FROM {functions_table}
+                    """).fetchone()
+                    
+                    if result:
+                        summary.update({
+                            'score_statistics': {
+                                'total_functions': result[0],
+                                'functions_with_scores': result[1],
+                                'avg_original_rank': result[2],
+                                'avg_perturbed_rank': result[3],
+                                'avg_detectcodegpt_score': result[4],
+                                'min_detectcodegpt_score': result[5],
+                                'max_detectcodegpt_score': result[6],
+                                'std_detectcodegpt_score': result[7]
+                            }
+                        })
+                    
+                    # Score distribution by function type
+                    result = self.conn.execute(f"""
+                        SELECT 
+                            function_type,
+                            COUNT(*) as count,
+                            AVG(detectcodegpt_score) as avg_score,
+                            MIN(detectcodegpt_score) as min_score,
+                            MAX(detectcodegpt_score) as max_score
+                        FROM {functions_table}
+                        WHERE detectcodegpt_score IS NOT NULL
+                        GROUP BY function_type
+                    """).fetchall()
+                    
+                    score_by_type = {}
+                    for row in result:
+                        score_by_type[row[0]] = {
+                            'count': row[1],
+                            'avg_score': row[2],
+                            'min_score': row[3],
+                            'max_score': row[4]
+                        }
+                    
+                    summary['score_by_type'] = score_by_type
+                else:
+                    summary['score_statistics'] = None
+                    summary['score_by_type'] = {}
+            
+        except Exception as e:
+            logger.error(f"Error getting repo/year summary: {e}")
+            summary['error'] = str(e)
+        
+        return summary
+    
+    def get_all_repositories_summary(self, include_scores: bool = True) -> List[Dict[str, Any]]:
+        """Get summary for all repositories and years in the database."""
+        repos = self.list_available_repositories()
+        summaries = []
+        
+        original_repo = self.repo_name
+        original_year = self.year
+        
+        try:
+            for repo_info in repos:
+                repo_name = repo_info['name']
+                years = repo_info['years']
+                
+                for year in years:
+                    self.repo_name = repo_name
+                    self.year = year
+                    summary = self.get_repo_year_summary(include_scores)
+                    summaries.append(summary)
+        finally:
+            # Restore original values
+            self.repo_name = original_repo
+            self.year = original_year
+        
+        return summaries
 
 
 class AIDetector:
@@ -626,10 +911,20 @@ class AIDetector:
         """Optimized version of calculate_scores with batch processing."""
         results = []
         
-        # Extract source codes
-        source_codes = [func['source_code'] for func in functions]
+        # Extract source codes and filter by sequence length
+        source_codes = []
+        filtered_functions = []
         
-        logger.info(f"Processing {len(functions)} functions...")
+        for func in functions:
+            # Estimate sequence length by tokenizing
+            tokens = self.model_config['base_tokenizer'].encode(func['source_code'], add_special_tokens=True)
+            if len(tokens) <= 700:
+                source_codes.append(func['source_code'])
+                filtered_functions.append(func)
+            else:
+                logger.warning(f"Skipping function {func['name']} (file: {func['file_path']}:{func['line_number']}) - sequence length {len(tokens)} > 700")
+        
+        logger.info(f"Processing {len(filtered_functions)} functions (filtered from {len(functions)} - excluded {len(functions) - len(filtered_functions)} with seq_len > 700)...")
         
         # Calculate unperturbed log ranks in batches
         logger.info("Calculating unperturbed log ranks...")
@@ -653,9 +948,13 @@ class AIDetector:
             chunk = perturbed_codes[i:i + n_perturbations]
             chunk_ranks = get_ranks_fast(chunk, self.args, self.model_config, log=True, batch_size=len(chunk))
             perturbed_ranks.append(chunk_ranks)
+            
+            # Clear GPU memory after each chunk to prevent accumulation
+            if self.args.DEVICE == 'cuda':
+                torch.cuda.empty_cache()
         
         # Compile results
-        for i, func in enumerate(functions):
+        for i, func in enumerate(filtered_functions):
             original_rank = original_ranks[i]
             p_ranks = perturbed_ranks[i]
             
@@ -723,6 +1022,13 @@ def create_args_from_config(config):
             self.function_type = config.get('filtering', {}).get('function_type')
             self.file_pattern = config.get('filtering', {}).get('file_pattern')
             
+            # AI Detection arguments
+            ai_detection = config.get('ai_detection', {})
+            self.store_scores = ai_detection.get('store_scores', True)
+            self.process_all_repos = ai_detection.get('process_all_repos', False)
+            self.show_summary = ai_detection.get('show_summary', True)
+            self.summary_only = ai_detection.get('summary_only', False)
+            
             # Model arguments
             self.base_model_name = config.get('models', {}).get('base_model_name', 'codellama/CodeLlama-7b-hf')
             self.mask_filling_model_name = config.get('models', {}).get('mask_filling_model_name', 'Salesforce/codet5p-770m')
@@ -769,7 +1075,6 @@ def create_args_from_config(config):
             self.dataset_key = config.get('dataset', {}).get('key', '')
             self.min_len = config.get('processing', {}).get('min_len', 0)
             self.max_len = config.get('processing', {}).get('max_len', 128)
-            
     
     return Args(config)
 
@@ -825,6 +1130,203 @@ def print_results(results: List[Dict[str, Any]]):
     print(f"  Score = Perturbed_Rank_Mean / Original_Rank")
 
 
+def print_repo_year_summaries(summaries: List[Dict[str, Any]]):
+    """Print comprehensive summaries per repository per year."""
+    print("\n" + "="*100)
+    print("AI DETECTION RESULTS SUMMARY BY REPOSITORY AND YEAR")
+    print("="*100)
+    
+    # Group summaries by repository
+    repos = {}
+    for summary in summaries:
+        repo_name = summary['repository']
+        if repo_name not in repos:
+            repos[repo_name] = []
+        repos[repo_name].append(summary)
+    
+    for repo_name, repo_summaries in repos.items():
+        print(f"\n{'='*60}")
+        print(f"REPOSITORY: {repo_name.upper()}")
+        print(f"{'='*60}")
+        
+        # Sort by year
+        repo_summaries.sort(key=lambda x: x['year'])
+        
+        # Repository totals
+        total_functions = sum(s['total_functions'] for s in repo_summaries)
+        total_files = sum(s['unique_files'] for s in repo_summaries)
+        years = [s['year'] for s in repo_summaries]
+        
+        print(f"\nRepository Overview:")
+        print(f"  Years available: {min(years)} - {max(years)} ({len(years)} years)")
+        print(f"  Total functions across all years: {total_functions}")
+        print(f"  Total unique files: {total_files}")
+        
+        # Year-by-year breakdown
+        print(f"\nYear-by-Year Results:")
+        print(f"{'Year':<6} {'Functions':<10} {'Files':<8} {'Scored':<8} {'Avg Score':<12} {'Min Score':<12} {'Max Score':<12} {'Status':<10}")
+        print("-" * 100)
+        
+        for summary in repo_summaries:
+            year = summary['year']
+            total_funcs = summary['total_functions']
+            unique_files = summary['unique_files']
+            
+            # Check if processing failed
+            if summary.get('processing_failed'):
+                status = "FAILED"
+                print(f"{year:<6} {total_funcs:<10} {unique_files:<8} {'0':<8} "
+                      f"{'N/A':<12} {'N/A':<12} {'N/A':<12} {status:<10}")
+                if summary.get('error'):
+                    print(f"    Error: {summary['error']}")
+                continue
+            
+            # Score statistics
+            score_stats = summary.get('score_statistics')
+            if score_stats and score_stats['functions_with_scores'] > 0:
+                scored_count = score_stats['functions_with_scores']
+                avg_score = score_stats['avg_detectcodegpt_score']
+                min_score = score_stats['min_detectcodegpt_score']
+                max_score = score_stats['max_detectcodegpt_score']
+                status = "SUCCESS"
+                
+                print(f"{year:<6} {total_funcs:<10} {unique_files:<8} {scored_count:<8} "
+                      f"{avg_score:<12.4f} {min_score:<12.4f} {max_score:<12.4f} {status:<10}")
+            else:
+                status = "NO_SCORES"
+                print(f"{year:<6} {total_funcs:<10} {unique_files:<8} {'0':<8} "
+                      f"{'N/A':<12} {'N/A':<12} {'N/A':<12} {status:<10}")
+        
+        # Function type breakdown for repository
+        print(f"\nFunction Types Across All Years:")
+        all_types = {}
+        for summary in repo_summaries:
+            for func_type, count in summary.get('by_type', {}).items():
+                all_types[func_type] = all_types.get(func_type, 0) + count
+        
+        for func_type, count in sorted(all_types.items()):
+            print(f"  {func_type}: {count}")
+        
+        # Detailed score analysis if available
+        scored_summaries = [s for s in repo_summaries if s.get('score_statistics') and s['score_statistics']['functions_with_scores'] > 0]
+        if scored_summaries:
+            print(f"\nAI Detection Score Analysis:")
+            
+            # Overall score statistics for repository
+            all_avg_scores = [s['score_statistics']['avg_detectcodegpt_score'] for s in scored_summaries]
+            all_std_scores = [s['score_statistics']['std_detectcodegpt_score'] for s in scored_summaries if s['score_statistics']['std_detectcodegpt_score'] is not None]
+            
+            if all_avg_scores:
+                print(f"  Repository average score: {np.mean(all_avg_scores):.4f}")
+                print(f"  Repository score range: {min(s['score_statistics']['min_detectcodegpt_score'] for s in scored_summaries):.4f} - {max(s['score_statistics']['max_detectcodegpt_score'] for s in scored_summaries):.4f}")
+                if all_std_scores:
+                    print(f"  Average std deviation: {np.mean(all_std_scores):.4f}")
+            
+            # Score by function type (aggregated across years)
+            print(f"\n  Score by Function Type (Aggregated):")
+            type_scores = {}
+            for summary in scored_summaries:
+                for func_type, type_stats in summary.get('score_by_type', {}).items():
+                    if func_type not in type_scores:
+                        type_scores[func_type] = {'total_count': 0, 'total_score': 0, 'min_score': float('inf'), 'max_score': float('-inf')}
+                    
+                    type_scores[func_type]['total_count'] += type_stats['count']
+                    type_scores[func_type]['total_score'] += type_stats['avg_score'] * type_stats['count']
+                    type_scores[func_type]['min_score'] = min(type_scores[func_type]['min_score'], type_stats['min_score'])
+                    type_scores[func_type]['max_score'] = max(type_scores[func_type]['max_score'], type_stats['max_score'])
+            
+            for func_type, stats in sorted(type_scores.items()):
+                avg_score = stats['total_score'] / stats['total_count'] if stats['total_count'] > 0 else 0
+                print(f"    {func_type}: {avg_score:.4f} (n={stats['total_count']}, range={stats['min_score']:.4f}-{stats['max_score']:.4f})")
+    
+    # Overall summary across all repositories
+    print(f"\n{'='*100}")
+    print("OVERALL SUMMARY ACROSS ALL REPOSITORIES")
+    print(f"{'='*100}")
+    
+    total_repos = len(repos)
+    total_years = len(summaries)
+    grand_total_functions = sum(s['total_functions'] for s in summaries)
+    grand_total_files = sum(s['unique_files'] for s in summaries)
+    
+    print(f"Total repositories: {total_repos}")
+    print(f"Total repository-years: {total_years}")
+    print(f"Grand total functions: {grand_total_functions}")
+    print(f"Grand total files: {grand_total_files}")
+    
+    # Overall score statistics
+    scored_summaries = [s for s in summaries if s.get('score_statistics') and s['score_statistics']['functions_with_scores'] > 0]
+    if scored_summaries:
+        total_scored_functions = sum(s['score_statistics']['functions_with_scores'] for s in scored_summaries)
+        all_avg_scores = [s['score_statistics']['avg_detectcodegpt_score'] for s in scored_summaries]
+        all_min_scores = [s['score_statistics']['min_detectcodegpt_score'] for s in scored_summaries]
+        all_max_scores = [s['score_statistics']['max_detectcodegpt_score'] for s in scored_summaries]
+        
+        print(f"\nOverall AI Detection Results:")
+        print(f"Total functions with scores: {total_scored_functions}")
+        print(f"Coverage: {(total_scored_functions/grand_total_functions)*100:.1f}% of all functions")
+        print(f"Average score across all repos/years: {np.mean(all_avg_scores):.4f}")
+        print(f"Global score range: {min(all_min_scores):.4f} - {max(all_max_scores):.4f}")
+        
+        print(f"\nInterpretation:")
+        print(f"  Higher scores (>1.0) indicate higher likelihood of being AI-generated")
+        print(f"  Lower scores (<1.0) indicate higher likelihood of being human-written")
+        print(f"  Score = Perturbed_Rank_Mean / Original_Rank")
+    else:
+        print(f"\nNo AI detection scores available in database.")
+        print(f"Run AI detection first to generate scores.")
+
+
+def process_single_repo_year(loader: FunctionLoader, detector: AIDetector, args) -> Dict[str, Any]:
+    """Process a single repository/year combination."""
+    print(f"\n{'='*60}")
+    print(f"PROCESSING: {loader.repo_name} ({loader.year})")
+    print(f"{'='*60}")
+    
+    # Get functions for this repo/year
+    if args.summary_only:
+        # Just get summary without processing
+        functions = []
+    else:
+        functions = loader.get_functions(
+            limit=args.limit,
+            function_type=args.function_type,
+            file_pattern=args.file_pattern
+        )
+    
+    if not functions and not args.summary_only:
+        print(f"No functions found for {loader.repo_name} ({loader.year})")
+        return loader.get_repo_year_summary()
+    
+    results = []
+    if functions:
+        print(f"Found {len(functions)} functions to process")
+        
+        # Calculate scores with timing
+        import time
+        start_time = time.time()
+        
+        results = detector.calculate_scores(functions, args.n_perturbations)
+        
+        end_time = time.time()
+        processing_time = end_time - start_time
+        
+        print(f"Processed {len(results)} functions in {processing_time:.2f} seconds")
+        
+        # Store scores if requested
+        if args.store_scores and results:
+            print("Storing scores to database...")
+            success = loader.update_function_scores(results)
+            if success:
+                print(f"Successfully stored {len(results)} scores")
+            else:
+                print("Failed to store scores")
+    
+    # Get summary including score statistics
+    summary = loader.get_repo_year_summary()
+    return summary
+
+
 def main():
     """Main function."""
     args = setup_args()
@@ -856,99 +1358,191 @@ def main():
     for repo in available_repos:
         print(f"  {repo['name']}: {repo['years']} ({repo['total_years']} years)")
     
-    # Determine which years to process
-    if args.year is None:
-        # Process all available years for the repository
-        target_repo = next((repo for repo in available_repos if repo['name'] == args.repo_name), None)
-        if target_repo:
-            years_to_process = target_repo['years']
-            print(f"\nProcessing all available years for {args.repo_name}: {years_to_process}")
+    # Determine processing scope
+    if args.process_all_repos:
+        print(f"\nProcessing ALL repositories and years...")
+        summaries = []
+        
+        if not args.summary_only:
+            # Initialize AI detector only if we need to process functions
+            detector = AIDetector(args)
         else:
-            logger.error(f"Repository {args.repo_name} not found in database")
-            return
+            detector = None
+        
+        for repo_info in available_repos:
+            repo_name = repo_info['name']
+            years = repo_info['years']
+            
+            for year in years:
+                # Create loader for this specific repo/year
+                repo_loader = FunctionLoader(args.db_path, repo_name, year)
+                
+                try:
+                    if detector:
+                        summary = process_single_repo_year(repo_loader, detector, args)
+                    else:
+                        summary = repo_loader.get_repo_year_summary()
+                    summaries.append(summary)
+                except Exception as e:
+                    logger.error(f"Error processing {repo_name} ({year}): {e}")
+                    # Still get summary even if scoring failed
+                    try:
+                        summary = repo_loader.get_repo_year_summary()
+                        summary['error'] = str(e)
+                        summary['processing_failed'] = True
+                        summaries.append(summary)
+                    except Exception as summary_error:
+                        logger.error(f"Failed to get summary for {repo_name} ({year}): {summary_error}")
+                        # Add minimal summary with error info
+                        summaries.append({
+                            'repository': repo_name,
+                            'year': year,
+                            'error': str(e),
+                            'processing_failed': True,
+                            'total_functions': 0,
+                            'unique_files': 0,
+                            'by_type': {}
+                        })
+                finally:
+                    repo_loader.close()
+        
+                # Clear GPU memory between years to prevent accumulation
+                if detector and args.DEVICE == 'cuda':
+                    torch.cuda.empty_cache()
+                    logger.info(f"Cleared GPU memory after processing year {year}")
+        if args.show_summary:
+            print_repo_year_summaries(summaries)
+    
     else:
-        years_to_process = [args.year]
-        print(f"\nProcessing specific year: {args.year}")
-    
-    # Show database statistics
-    if len(years_to_process) == 1:
-        stats = loader.get_function_stats()
-        print(f"\nDatabase Statistics for {stats['repository']} ({stats['year']}):")
-        print(f"  Total functions: {stats['total_functions']}")
-        print(f"  Unique files: {stats['unique_files']}")
-        print(f"  Functions by type: {stats['by_type']}")
-    else:
-        stats = loader.get_function_stats_for_multiple_years(years_to_process)
-        print(f"\nDatabase Statistics for {stats['repository']} ({stats['years']}):")
-        print(f"  Total functions: {stats['total_functions']}")
-        print(f"  Unique files: {stats['unique_files']}")
-        print(f"  Functions by type: {stats['by_type']}")
-        print(f"  Year breakdown:")
-        for year_stat in stats['year_stats']:
-            print(f"    {year_stat['year']}: {year_stat['total_functions']} functions")
-    
-    # Load functions with filters
-    if len(years_to_process) == 1:
-        functions = loader.get_functions(
-            limit=args.limit,
-            function_type=args.function_type,
-            file_pattern=args.file_pattern
-        )
-    else:
-        functions = loader.get_functions_for_multiple_years(
-            years_to_process,
-            limit=args.limit,
-            function_type=args.function_type,
-            file_pattern=args.file_pattern
-        )
-    
-    if not functions:
-        raise ValueError("No functions found matching the criteria")
-    
-    print(f"\nProcessing {len(functions)} functions...")
-    
-    # Show model loading information
-    mask_required_types = ['random', 'identifier-masking']
-    if args.perturb_type in mask_required_types:
-        print(f"Perturbation type '{args.perturb_type}' requires mask filling model")
-        print(f"Will load: Base model + Mask filling model")
-    else:
-        print(f"Perturbation type '{args.perturb_type}' does not require mask filling model")
-        print(f"Will load: Base model only (saving memory)")
-    
-    # Initialize AI detector
-    detector = AIDetector(args)
-    
-    # Calculate scores with timing
-    import time
-    start_time = time.time()
-    
-    results = detector.calculate_scores(functions, args.n_perturbations)
-    
-    end_time = time.time()
-    processing_time = end_time - start_time
-    
-    # Print results
-    print_results(results)
-    
-    # Show performance metrics
-    print(f"\n" + "="*80)
-    print("PERFORMANCE METRICS")
-    print("="*80)
-    print(f"Total processing time: {processing_time:.2f} seconds")
-    print(f"Average time per function: {processing_time/len(functions):.3f} seconds")
-    print(f"Functions processed per second: {len(functions)/processing_time:.2f}")
-    
-    if args.n_perturbations > 0:
-        total_perturbations = len(functions) * args.n_perturbations
-        print(f"Total perturbations: {total_perturbations}")
-        print(f"Perturbations per second: {total_perturbations/processing_time:.2f}")
+        # Process single repository (original behavior with enhancements)
+        # Determine which years to process
+        if args.year is None:
+            # Process all available years for the repository
+            target_repo = next((repo for repo in available_repos if repo['name'] == args.repo_name), None)
+            if target_repo:
+                years_to_process = target_repo['years']
+                print(f"\nProcessing all available years for {args.repo_name}: {years_to_process}")
+            else:
+                logger.error(f"Repository {args.repo_name} not found in database")
+                return
+        else:
+            years_to_process = [args.year]
+            print(f"\nProcessing specific year: {args.year}")
+        
+        # Show database statistics
+        if len(years_to_process) == 1:
+            stats = loader.get_function_stats()
+            print(f"\nDatabase Statistics for {stats['repository']} ({stats['year']}):")
+            print(f"  Total functions: {stats['total_functions']}")
+            print(f"  Unique files: {stats['unique_files']}")
+            print(f"  Functions by type: {stats['by_type']}")
+        else:
+            stats = loader.get_function_stats_for_multiple_years(years_to_process)
+            print(f"\nDatabase Statistics for {stats['repository']} ({stats['years']}):")
+            print(f"  Total functions: {stats['total_functions']}")
+            print(f"  Unique files: {stats['unique_files']}")
+            print(f"  Functions by type: {stats['by_type']}")
+            print(f"  Year breakdown:")
+            for year_stat in stats['year_stats']:
+                print(f"    {year_stat['year']}: {year_stat['total_functions']} functions")
+        
+        summaries = []
+        
+        if not args.summary_only:
+            # Initialize AI detector
+            detector = AIDetector(args)
+            
+            # Show model loading information
+            mask_required_types = ['random', 'identifier-masking']
+            if args.perturb_type in mask_required_types:
+                print(f"Perturbation type '{args.perturb_type}' requires mask filling model")
+                print(f"Will load: Base model + Mask filling model")
+            else:
+                print(f"Perturbation type '{args.perturb_type}' does not require mask filling model")
+                print(f"Will load: Base model only (saving memory)")
+        else:
+            detector = None
+        
+        # Process each year
+        for year in years_to_process:
+            year_loader = FunctionLoader(args.db_path, args.repo_name, year)
+            
+            try:
+                if detector:
+                    summary = process_single_repo_year(year_loader, detector, args)
+                else:
+                    summary = year_loader.get_repo_year_summary()
+                summaries.append(summary)
+            except Exception as e:
+                logger.error(f"Error processing {args.repo_name} ({year}): {e}")
+                # Still get summary even if scoring failed
+                try:
+                    summary = year_loader.get_repo_year_summary()
+                    summary['error'] = str(e)
+                    summary['processing_failed'] = True
+                    summaries.append(summary)
+                except Exception as summary_error:
+                    logger.error(f"Failed to get summary for {args.repo_name} ({year}): {summary_error}")
+                    # Add minimal summary with error info
+                    summaries.append({
+                        'repository': args.repo_name,
+                        'year': year,
+                        'error': str(e),
+                        'processing_failed': True,
+                        'total_functions': 0,
+                        'unique_files': 0,
+                        'by_type': {}
+                    })
+            finally:
+                year_loader.close()
+            
+            # Clear GPU memory between years to prevent accumulation
+            if detector and args.DEVICE == 'cuda':
+                torch.cuda.empty_cache()
+                logger.info(f"Cleared GPU memory after processing year {year}")
+        
+        if args.show_summary:
+            if len(years_to_process) > 1:
+                print_repo_year_summaries(summaries)
+            else:
+                # Single year - show detailed results
+                summary = summaries[0]
+                if not args.summary_only:
+                    # Also get and print individual results
+                    functions = loader.get_functions_with_scores(
+                        limit=args.limit,
+                        function_type=args.function_type,
+                        file_pattern=args.file_pattern,
+                        has_scores=True
+                    )
+                    
+                    if functions:
+                        # Convert to results format for printing
+                        results = []
+                        for func in functions:
+                            if func.get('original_rank') is not None:
+                                results.append({
+                                    'function_id': func['id'],
+                                    'name': func['name'],
+                                    'file_path': func['file_path'],
+                                    'line_number': func['line_number'],
+                                    'function_type': func['function_type'],
+                                    'class_name': func['class_name'],
+                                    'original_rank': func['original_rank'],
+                                    'perturbed_rank_mean': func['perturbed_rank_mean'],
+                                    'detectcodegpt_score': func['detectcodegpt_score']
+                                })
+                        
+                        if results:
+                            print_results(results)
+                
+                print_repo_year_summaries(summaries)
     
     # Cleanup
     loader.close()
     torch.cuda.empty_cache()
     
-    logger.info("AI detection completed successfully with optimized performance!")
+    logger.info("AI detection completed successfully!")
 
 
 if __name__ == "__main__":

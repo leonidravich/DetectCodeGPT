@@ -26,6 +26,13 @@ filtering:
   function_type: null  # Filter by function type (function, method, class_method, staticmethod)
   file_pattern: null  # Filter by file path pattern
 
+# AI Detection Configuration (for ai_detector.py)
+ai_detection:
+  store_scores: true  # Store calculated scores back to database
+  process_all_repos: false  # Process all repositories and years in database
+  show_summary: true  # Show summary results per repo/year
+  summary_only: false  # Only show summaries without processing (useful for viewing existing results)
+
 # Model Configuration (for ai_detector.py)
 models:
   base_model_name: "codellama/CodeLlama-7b-hf"
