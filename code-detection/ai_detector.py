@@ -27,7 +27,7 @@ import multiprocessing as mp
 # Add the code-detection directory to the path to import baselines
 sys.path.append('code-detection')
 
-from baselines.rank import get_ranks, get_rank
+from baselines.rank_fast import get_ranks_fast, get_rank_fast
 from baselines.utils.loadmodel import load_base_model_and_tokenizer, load_mask_filling_model
 from baselines.utils.preprocessing import preprocess_and_save
 from identifier_tagging import get_identifier
@@ -638,7 +638,7 @@ class AIDetector:
         
         for i in tqdm(range(0, len(source_codes), batch_size), desc="Computing unperturbed log ranks"):
             batch_codes = source_codes[i:i + batch_size]
-            batch_ranks = get_ranks(batch_codes, self.args, self.model_config, log=True)
+            batch_ranks = get_ranks_fast(batch_codes, self.args, self.model_config, log=True, batch_size=batch_size)
             original_ranks.extend(batch_ranks)
         
         # Apply perturbations with optimized method
@@ -651,7 +651,7 @@ class AIDetector:
         
         for i in tqdm(range(0, len(perturbed_codes), n_perturbations), desc="Computing perturbed log ranks"):
             chunk = perturbed_codes[i:i + n_perturbations]
-            chunk_ranks = get_ranks(chunk, self.args, self.model_config, log=True)
+            chunk_ranks = get_ranks_fast(chunk, self.args, self.model_config, log=True, batch_size=len(chunk))
             perturbed_ranks.append(chunk_ranks)
         
         # Compile results
