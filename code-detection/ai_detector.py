@@ -463,7 +463,8 @@ class FunctionLoader:
                             AVG(detectcodegpt_score) as avg_detectcodegpt_score,
                             MIN(detectcodegpt_score) as min_detectcodegpt_score,
                             MAX(detectcodegpt_score) as max_detectcodegpt_score,
-                            STDDEV(detectcodegpt_score) as std_detectcodegpt_score
+                            STDDEV(detectcodegpt_score) as std_detectcodegpt_score,
+                            PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY detectcodegpt_score) as p90_detectcodegpt_score
                         FROM {functions_table}
                     """).fetchone()
                     
@@ -477,7 +478,8 @@ class FunctionLoader:
                                 'avg_detectcodegpt_score': result[4],
                                 'min_detectcodegpt_score': result[5],
                                 'max_detectcodegpt_score': result[6],
-                                'std_detectcodegpt_score': result[7]
+                                'std_detectcodegpt_score': result[7],
+                                'p90_detectcodegpt_score': result[8]
                             }
                         })
                     
@@ -1164,8 +1166,8 @@ def print_repo_year_summaries(summaries: List[Dict[str, Any]]):
         
         # Year-by-year breakdown
         print(f"\nYear-by-Year Results:")
-        print(f"{'Year':<6} {'Functions':<10} {'Files':<8} {'Scored':<8} {'Avg Score':<12} {'Min Score':<12} {'Max Score':<12} {'Status':<10}")
-        print("-" * 100)
+        print(f"{'Year':<6} {'Functions':<10} {'Files':<8} {'Scored':<8} {'Avg Score':<12} {'Min Score':<12} {'Max Score':<12} {'P90 Score':<12} {'Status':<10}")
+        print("-" * 112)
         
         for summary in repo_summaries:
             year = summary['year']
@@ -1176,7 +1178,7 @@ def print_repo_year_summaries(summaries: List[Dict[str, Any]]):
             if summary.get('processing_failed'):
                 status = "FAILED"
                 print(f"{year:<6} {total_funcs:<10} {unique_files:<8} {'0':<8} "
-                      f"{'N/A':<12} {'N/A':<12} {'N/A':<12} {status:<10}")
+                      f"{'N/A':<12} {'N/A':<12} {'N/A':<12} {'N/A':<12} {status:<10}")
                 if summary.get('error'):
                     print(f"    Error: {summary['error']}")
                 continue
@@ -1188,14 +1190,15 @@ def print_repo_year_summaries(summaries: List[Dict[str, Any]]):
                 avg_score = score_stats['avg_detectcodegpt_score']
                 min_score = score_stats['min_detectcodegpt_score']
                 max_score = score_stats['max_detectcodegpt_score']
+                p90_score = score_stats['p90_detectcodegpt_score']
                 status = "SUCCESS"
                 
                 print(f"{year:<6} {total_funcs:<10} {unique_files:<8} {scored_count:<8} "
-                      f"{avg_score:<12.4f} {min_score:<12.4f} {max_score:<12.4f} {status:<10}")
+                      f"{avg_score:<12.4f} {min_score:<12.4f} {max_score:<12.4f} {p90_score:<12.4f} {status:<10}")
             else:
                 status = "NO_SCORES"
                 print(f"{year:<6} {total_funcs:<10} {unique_files:<8} {'0':<8} "
-                      f"{'N/A':<12} {'N/A':<12} {'N/A':<12} {status:<10}")
+                      f"{'N/A':<12} {'N/A':<12} {'N/A':<12} {'N/A':<12} {status:<10}")
         
         # Function type breakdown for repository
         print(f"\nFunction Types Across All Years:")
@@ -1221,6 +1224,11 @@ def print_repo_year_summaries(summaries: List[Dict[str, Any]]):
                 print(f"  Repository score range: {min(s['score_statistics']['min_detectcodegpt_score'] for s in scored_summaries):.4f} - {max(s['score_statistics']['max_detectcodegpt_score'] for s in scored_summaries):.4f}")
                 if all_std_scores:
                     print(f"  Average std deviation: {np.mean(all_std_scores):.4f}")
+                
+                # Calculate and display 90th percentile statistics
+                all_p90_scores = [s['score_statistics']['p90_detectcodegpt_score'] for s in scored_summaries if s['score_statistics']['p90_detectcodegpt_score'] is not None]
+                if all_p90_scores:
+                    print(f"  Repository 90th percentile score: {np.mean(all_p90_scores):.4f}")
             
             # Score by function type (aggregated across years)
             print(f"\n  Score by Function Type (Aggregated):")
@@ -1267,6 +1275,11 @@ def print_repo_year_summaries(summaries: List[Dict[str, Any]]):
         print(f"Coverage: {(total_scored_functions/grand_total_functions)*100:.1f}% of all functions")
         print(f"Average score across all repos/years: {np.mean(all_avg_scores):.4f}")
         print(f"Global score range: {min(all_min_scores):.4f} - {max(all_max_scores):.4f}")
+        
+        # Add 90th percentile statistics
+        all_p90_scores = [s['score_statistics']['p90_detectcodegpt_score'] for s in scored_summaries if s['score_statistics']['p90_detectcodegpt_score'] is not None]
+        if all_p90_scores:
+            print(f"Global 90th percentile score: {np.mean(all_p90_scores):.4f}")
         
         print(f"\nInterpretation:")
         print(f"  Higher scores (>1.0) indicate higher likelihood of being AI-generated")
