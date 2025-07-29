@@ -10,7 +10,7 @@ database:
 
 # Repository Configuration (for folder_lader.py)
 repository:
-  path: "."
+  path: "D:/kernel/linux"
   name: "detectcodegpt"  # Repository name for table naming
   year: 2025  # Year for table naming (defaults to current year if not specified)
   search: null  # Search query for functions
@@ -19,6 +19,24 @@ repository:
     enabled: true  # Enable git repository functionality
     use_worktree: true  # Use git worktree for year-based extraction
     cleanup_worktree: true  # Automatically cleanup temporary worktrees
+
+# Language Configuration
+languages:
+  enabled: ["python", "cpp"]  # Languages to process: python, cpp
+  extensions:
+    python: [".py"]
+    cpp: [".cpp", ".cxx", ".cc", ".c", ".hpp", ".hxx", ".h"]
+  parsing:
+    python:
+      extract_docstrings: true
+      extract_decorators: true
+      extract_generators: true
+    cpp:
+      extract_comments: true  # Extract documentation comments
+      extract_templates: true  # Extract template information
+      extract_namespaces: true  # Extract namespace information
+      include_headers: true  # Include header files (.h, .hpp)
+      member_functions_only: false  # If true, only extract member functions
 
 # Function Filtering (for ai_detector.py)
 filtering:

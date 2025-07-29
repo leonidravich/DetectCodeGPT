@@ -25,6 +25,8 @@ import time
 from functools import lru_cache
 from collections import defaultdict, deque
 import multiprocessing as mp
+import re
+from abc import ABC, abstractmethod
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -202,7 +204,7 @@ class FunctionInfo:
     file_path: str
     line_number: int
     end_line: int
-    function_type: str  # 'function', 'method', 'class_method', 'staticmethod'
+    function_type: str  # 'function', 'method', 'class_method', 'staticmethod', 'constructor', 'destructor'
     class_name: Optional[str]
     docstring: Optional[str]
     signature: str
@@ -212,6 +214,9 @@ class FunctionInfo:
     return_annotation: Optional[str]
     is_async: bool
     is_generator: bool
+    language: str  # Programming language: 'python', 'cpp'
+    namespace: Optional[str] = None  # For C++ namespaces
+    template_parameters: Optional[str] = None  # For C++ templates
     # Git commit metadata
     commit_hash: Optional[str] = None
     commit_date: Optional[str] = None
@@ -219,10 +224,637 @@ class FunctionInfo:
     commit_message: Optional[str] = None
 
 
-class CodeExtractor:
-    """Extracts functions and methods from Python files using AST parsing."""
+class BaseParser(ABC):
+    """Abstract base class for language-specific parsers."""
     
-    def __init__(self, repo_path: str = ".", max_workers: int = None):
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.language = self._get_language_name()
+        self.extensions = self._get_file_extensions()
+        self.parsing_config = config.get('languages', {}).get('parsing', {}).get(self.language, {})
+    
+    @abstractmethod
+    def _get_language_name(self) -> str:
+        """Return the language identifier."""
+        pass
+    
+    @abstractmethod
+    def _get_file_extensions(self) -> List[str]:
+        """Return supported file extensions for this language."""
+        pass
+    
+    @abstractmethod
+    def extract_functions(self, file_path: str, file_content: str, git_cache: 'GitCache', 
+                         target_year: Optional[int] = None) -> List[FunctionInfo]:
+        """Extract functions from the given file content."""
+        pass
+    
+    def supports_file(self, file_path: str) -> bool:
+        """Check if this parser supports the given file."""
+        return any(file_path.endswith(ext) for ext in self.extensions)
+    
+    def get_commit_info(self, file_path: str, line_number: int, git_cache: 'GitCache') -> Dict[str, Any]:
+        """Get git commit information for a specific line."""
+        try:
+            relative_path = os.path.relpath(file_path, git_cache.repo_path)
+            commit_info = git_cache.get_line_commit_info(relative_path, line_number)
+            return commit_info if commit_info else {}
+        except Exception as e:
+            logger.warning(f"Error getting commit info for {file_path}:{line_number}: {e}")
+            return {}
+
+
+class PythonParser(BaseParser):
+    """Parser for Python files using AST."""
+    
+    def _get_language_name(self) -> str:
+        return "python"
+    
+    def _get_file_extensions(self) -> List[str]:
+        return self.config.get('languages', {}).get('extensions', {}).get('python', ['.py'])
+    
+    def extract_functions(self, file_path: str, file_content: str, git_cache: 'GitCache', 
+                         target_year: Optional[int] = None) -> List[FunctionInfo]:
+        """Extract functions from Python file using AST."""
+        functions = []
+        
+        try:
+            tree = ast.parse(file_content)
+            
+            # Process top-level nodes
+            for node in tree.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    function_info = self._visit_function(node, file_path, file_content, git_cache, target_year=target_year)
+                    if function_info:
+                        functions.append(function_info)
+                elif isinstance(node, ast.ClassDef):
+                    class_functions = self._visit_class(node, file_path, file_content, git_cache, target_year)
+                    functions.extend(class_functions)
+            
+            return functions
+            
+        except SyntaxError as e:
+            logger.warning(f"Syntax error in {file_path}: {e}")
+        except UnicodeDecodeError as e:
+            logger.warning(f"Encoding error in {file_path}: {e}")
+        except Exception as e:
+            logger.error(f"Error parsing {file_path}: {e}")
+        
+        return []
+    
+    def _visit_function(self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef], 
+                       file_path: str, file_content: str, git_cache: 'GitCache',
+                       class_name: Optional[str] = None, target_year: Optional[int] = None) -> Optional[FunctionInfo]:
+        """Extract information from a function or method."""
+        # Check if function was modified in target year
+        if target_year:
+            try:
+                was_modified_in_year = self._is_function_modified_in_year(
+                    file_path, node.lineno, node.end_lineno, target_year, git_cache
+                )
+                if not was_modified_in_year:
+                    return None
+            except Exception as e:
+                logger.warning(f"Error checking if function {node.name} was modified in {file_path}: {e}")
+        
+        # Determine function type
+        decorators = self._get_decorators(node)
+        if class_name:
+            if 'classmethod' in decorators:
+                function_type = 'class_method'
+            elif 'staticmethod' in decorators:
+                function_type = 'staticmethod'
+            else:
+                function_type = 'method'
+        else:
+            function_type = 'function'
+        
+        # Extract information
+        docstring = self._extract_docstring(node) if self.parsing_config.get('extract_docstrings', True) else None
+        arguments = self._get_arguments(node)
+        return_annotation = self._get_return_annotation(node)
+        is_async = isinstance(node, ast.AsyncFunctionDef)
+        is_generator = self._is_generator(node) if self.parsing_config.get('extract_generators', True) else False
+        
+        # Get source code
+        source_code = self._get_source_code(file_content, node.lineno, node.end_lineno)
+        
+        # Get git commit information
+        commit_info = self.get_commit_info(file_path, node.lineno, git_cache)
+        
+        return FunctionInfo(
+            name=node.name,
+            file_path=str(file_path),
+            line_number=node.lineno,
+            end_line=node.end_lineno,
+            function_type=function_type,
+            class_name=class_name,
+            docstring=docstring,
+            signature=ast.unparse(node),
+            source_code=source_code,
+            decorators=decorators if self.parsing_config.get('extract_decorators', True) else [],
+            arguments=arguments,
+            return_annotation=return_annotation,
+            is_async=is_async,
+            is_generator=is_generator,
+            language=self.language,
+            namespace=None,  # Python doesn't have namespaces like C++
+            template_parameters=None,  # Python doesn't have templates
+            commit_hash=commit_info.get('commit_hash'),
+            commit_date=commit_info.get('commit_date'),
+            commit_author=commit_info.get('commit_author'),
+            commit_message=commit_info.get('commit_message')
+        )
+    
+    def _visit_class(self, node: ast.ClassDef, file_path: str, file_content: str, 
+                    git_cache: 'GitCache', target_year: Optional[int] = None) -> List[FunctionInfo]:
+        """Visit class and extract its methods."""
+        class_functions = []
+        for item in node.body:
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                try:
+                    function_info = self._visit_function(item, file_path, file_content, git_cache, node.name, target_year)
+                    if function_info:
+                        class_functions.append(function_info)
+                except Exception as e:
+                    logger.warning(f"Error processing method {item.name} in class {node.name} in {file_path}: {e}")
+                    continue
+        return class_functions
+    
+    def _extract_docstring(self, node: ast.AST) -> Optional[str]:
+        """Extract docstring from AST node."""
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if (node.body and isinstance(node.body[0], ast.Expr) and 
+                isinstance(node.body[0].value, ast.Constant) and 
+                isinstance(node.body[0].value.value, str)):
+                return node.body[0].value.value.strip()
+        return None
+    
+    def _get_decorators(self, node: ast.AST) -> List[str]:
+        """Extract decorator names from AST node."""
+        decorators = []
+        for decorator in node.decorator_list:
+            try:
+                if isinstance(decorator, ast.Name):
+                    decorators.append(decorator.id)
+                elif isinstance(decorator, ast.Attribute):
+                    attr_parts = []
+                    current = decorator
+                    while isinstance(current, ast.Attribute):
+                        attr_parts.insert(0, current.attr)
+                        current = current.value
+                    if isinstance(current, ast.Name):
+                        attr_parts.insert(0, current.id)
+                    else:
+                        attr_parts = [decorator.attr]
+                    decorators.append(".".join(attr_parts))
+                elif isinstance(decorator, ast.Call):
+                    if isinstance(decorator.func, ast.Name):
+                        decorators.append(decorator.func.id)
+                    elif isinstance(decorator.func, ast.Attribute):
+                        attr_parts = []
+                        current = decorator.func
+                        while isinstance(current, ast.Attribute):
+                            attr_parts.insert(0, current.attr)
+                            current = current.value
+                        if isinstance(current, ast.Name):
+                            attr_parts.insert(0, current.id)
+                        else:
+                            attr_parts = [decorator.func.attr]
+                        decorators.append(".".join(attr_parts))
+            except Exception as e:
+                logger.debug(f"Could not parse decorator: {e}")
+                continue
+        return decorators
+    
+    def _get_arguments(self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> List[str]:
+        """Extract function arguments."""
+        args = []
+        
+        # Positional arguments
+        for arg in node.args.args:
+            args.append(arg.arg)
+        
+        # Keyword-only arguments
+        for arg in node.args.kwonlyargs:
+            args.append(f"*{arg.arg}")
+        
+        # Varargs
+        if node.args.vararg:
+            args.append(f"*{node.args.vararg.arg}")
+        
+        # Kwargs
+        if node.args.kwarg:
+            args.append(f"**{node.args.kwarg.arg}")
+        
+        return args
+    
+    def _get_return_annotation(self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> Optional[str]:
+        """Extract return annotation."""
+        if node.returns:
+            return ast.unparse(node.returns)
+        return None
+    
+    def _is_generator(self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> bool:
+        """Check if function is a generator."""
+        for item in ast.walk(node):
+            if isinstance(item, (ast.Yield, ast.YieldFrom)):
+                return True
+        return False
+    
+    def _get_source_code(self, file_content: str, start_line: int, end_line: int) -> str:
+        """Extract source code for a specific line range."""
+        lines = file_content.splitlines(keepends=True)
+        return ''.join(lines[start_line-1:end_line])
+    
+    def _is_function_modified_in_year(self, file_path: str, start_line: int, end_line: int, 
+                                     year: int, git_cache: 'GitCache') -> bool:
+        """Check if a function was modified in the specified year."""
+        relative_path = os.path.relpath(file_path, git_cache.repo_path)
+        relative_path_normalized = relative_path.replace(os.sep, '/')
+        
+        if not git_cache.is_file_modified_in_year(relative_path_normalized, year):
+            return False
+        
+        try:
+            result = subprocess.run(
+                ['git', 'log', '--format=%H', f'--since={year}-01-01', f'--until={year}-12-31', 
+                 '-L', f'{start_line},{end_line}:{relative_path_normalized}'],
+                cwd=git_cache.repo_path,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            
+            return bool(result.stdout.strip())
+            
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"Error checking if function was modified in {year}: {e}")
+            return False
+
+
+class CppParser(BaseParser):
+    """Parser for C/C++ files using regex-based parsing."""
+    
+    def _get_language_name(self) -> str:
+        return "cpp"
+    
+    def _get_file_extensions(self) -> List[str]:
+        return self.config.get('languages', {}).get('extensions', {}).get('cpp', ['.cpp', '.cxx', '.cc', '.c', '.hpp', '.hxx', '.h'])
+    
+    def extract_functions(self, file_path: str, file_content: str, git_cache: 'GitCache', 
+                         target_year: Optional[int] = None) -> List[FunctionInfo]:
+        """Extract functions from C/C++ file using regex parsing."""
+        functions = []
+        lines = file_content.splitlines()
+        
+        # Remove comments first for cleaner parsing
+        cleaned_content = self._remove_comments(file_content)
+        
+        # Extract namespace context
+        current_namespace = self._extract_namespaces(cleaned_content)
+        
+        # Extract functions
+        function_matches = self._find_functions(cleaned_content)
+        
+        for match in function_matches:
+            try:
+                function_info = self._create_function_info(
+                    match, file_path, file_content, lines, git_cache, 
+                    current_namespace, target_year
+                )
+                if function_info:
+                    functions.append(function_info)
+            except Exception as e:
+                logger.warning(f"Error processing C++ function in {file_path}: {e}")
+                continue
+        
+        # Extract class member functions
+        class_matches = self._find_classes(cleaned_content)
+        for class_match in class_matches:
+            class_functions = self._extract_class_members(
+                class_match, file_path, file_content, lines, git_cache, 
+                current_namespace, target_year
+            )
+            functions.extend(class_functions)
+        
+        return functions
+    
+    def _remove_comments(self, content: str) -> str:
+        """Remove C/C++ style comments from content."""
+        # Remove single-line comments
+        content = re.sub(r'//.*$', '', content, flags=re.MULTILINE)
+        # Remove multi-line comments
+        content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
+        return content
+    
+    def _extract_namespaces(self, content: str) -> List[str]:
+        """Extract namespace declarations."""
+        namespaces = []
+        namespace_pattern = r'namespace\s+(\w+)\s*\{'
+        matches = re.finditer(namespace_pattern, content)
+        for match in matches:
+            namespaces.append(match.group(1))
+        return namespaces
+    
+    def _find_functions(self, content: str) -> List[Dict[str, Any]]:
+        """Find function definitions using regex."""
+        functions = []
+        
+        # Pattern for C/C++ function definitions
+        # Matches: [template<...>] [static] [virtual] [inline] return_type function_name(parameters) [const] [override] { ... }
+        function_pattern = r'''
+            (?P<template>template\s*<[^>]*>\s*)?                    # Optional template
+            (?P<modifiers>(?:static|virtual|inline|extern|friend)\s+)*  # Optional modifiers
+            (?P<return_type>[\w:]+(?:\s*[*&]+)?)\s+                 # Return type
+            (?P<name>\w+)\s*                                        # Function name
+            \((?P<params>[^)]*)\)                                   # Parameters
+            (?P<qualifiers>\s*(?:const|override|final|noexcept)*\s*) # Optional qualifiers
+            \s*\{                                                   # Opening brace
+        '''
+        
+        matches = re.finditer(function_pattern, content, re.VERBOSE | re.MULTILINE)
+        
+        for match in matches:
+            start_pos = match.start()
+            # Find the matching closing brace
+            brace_count = 1
+            pos = match.end() - 1  # Start after the opening brace
+            end_pos = pos
+            
+            while pos < len(content) and brace_count > 0:
+                if content[pos] == '{':
+                    brace_count += 1
+                elif content[pos] == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        end_pos = pos + 1
+                        break
+                pos += 1
+            
+            # Calculate line numbers
+            start_line = content[:start_pos].count('\n') + 1
+            end_line = content[:end_pos].count('\n') + 1
+            
+            functions.append({
+                'match': match,
+                'start_line': start_line,
+                'end_line': end_line,
+                'start_pos': start_pos,
+                'end_pos': end_pos
+            })
+        
+        return functions
+    
+    def _find_classes(self, content: str) -> List[Dict[str, Any]]:
+        """Find class definitions using regex."""
+        classes = []
+        
+        # Pattern for C++ class/struct definitions
+        class_pattern = r'''
+            (?P<template>template\s*<[^>]*>\s*)?     # Optional template
+            (?P<type>class|struct)\s+               # class or struct keyword
+            (?P<name>\w+)                           # Class name
+            (?P<inheritance>\s*:\s*[^{]*)?          # Optional inheritance
+            \s*\{                                   # Opening brace
+        '''
+        
+        matches = re.finditer(class_pattern, content, re.VERBOSE | re.MULTILINE)
+        
+        for match in matches:
+            start_pos = match.start()
+            # Find the matching closing brace
+            brace_count = 1
+            pos = match.end() - 1  # Start after the opening brace
+            end_pos = pos
+            
+            while pos < len(content) and brace_count > 0:
+                if content[pos] == '{':
+                    brace_count += 1
+                elif content[pos] == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        end_pos = pos + 1
+                        break
+                pos += 1
+            
+            # Calculate line numbers
+            start_line = content[:start_pos].count('\n') + 1
+            end_line = content[:end_pos].count('\n') + 1
+            
+            classes.append({
+                'match': match,
+                'start_line': start_line,
+                'end_line': end_line,
+                'start_pos': start_pos,
+                'end_pos': end_pos,
+                'body': content[match.end()-1:end_pos]
+            })
+        
+        return classes
+    
+    def _extract_class_members(self, class_match: Dict[str, Any], file_path: str, 
+                              file_content: str, lines: List[str], git_cache: 'GitCache',
+                              namespaces: List[str], target_year: Optional[int] = None) -> List[FunctionInfo]:
+        """Extract member functions from a class."""
+        members = []
+        class_name = class_match['match'].group('name')
+        class_body = class_match['body']
+        
+        # Find member functions within the class
+        member_functions = self._find_functions(class_body)
+        
+        for func_match in member_functions:
+            try:
+                # Adjust line numbers to be relative to the whole file
+                func_match['start_line'] += class_match['start_line'] - 1
+                func_match['end_line'] += class_match['start_line'] - 1
+                
+                function_info = self._create_function_info(
+                    func_match, file_path, file_content, lines, git_cache,
+                    namespaces, target_year, class_name
+                )
+                if function_info:
+                    members.append(function_info)
+            except Exception as e:
+                logger.warning(f"Error processing C++ member function in {file_path}: {e}")
+                continue
+        
+        return members
+    
+    def _create_function_info(self, func_match: Dict[str, Any], file_path: str, 
+                             file_content: str, lines: List[str], git_cache: 'GitCache',
+                             namespaces: List[str], target_year: Optional[int] = None,
+                             class_name: Optional[str] = None) -> Optional[FunctionInfo]:
+        """Create FunctionInfo from a function match."""
+        match = func_match['match']
+        start_line = func_match['start_line']
+        end_line = func_match['end_line']
+        
+        # Check if function was modified in target year
+        if target_year:
+            try:
+                was_modified_in_year = self._is_function_modified_in_year(
+                    file_path, start_line, end_line, target_year, git_cache
+                )
+                if not was_modified_in_year:
+                    return None
+            except Exception as e:
+                logger.warning(f"Error checking if C++ function was modified: {e}")
+        
+        # Extract function details
+        name = match.group('name')
+        return_type = match.group('return_type').strip()
+        params = match.group('params').strip() if match.group('params') else ""
+        template = match.group('template').strip() if match.group('template') else None
+        modifiers = match.group('modifiers').strip() if match.group('modifiers') else ""
+        qualifiers = match.group('qualifiers').strip() if match.group('qualifiers') else ""
+        
+        # Determine function type
+        function_type = self._determine_function_type(name, class_name, modifiers)
+        
+        # Build signature
+        signature_parts = []
+        if template:
+            signature_parts.append(template)
+        if modifiers:
+            signature_parts.append(modifiers)
+        signature_parts.extend([return_type, f"{name}({params})"])
+        if qualifiers:
+            signature_parts.append(qualifiers)
+        signature = " ".join(signature_parts)
+        
+        # Extract arguments
+        arguments = self._parse_cpp_parameters(params)
+        
+        # Get source code
+        source_code = '\n'.join(lines[start_line-1:end_line])
+        
+        # Extract documentation comment
+        docstring = self._extract_cpp_documentation(lines, start_line)
+        
+        # Get git commit information
+        commit_info = self.get_commit_info(file_path, start_line, git_cache)
+        
+        return FunctionInfo(
+            name=name,
+            file_path=str(file_path),
+            line_number=start_line,
+            end_line=end_line,
+            function_type=function_type,
+            class_name=class_name,
+            docstring=docstring if self.parsing_config.get('extract_comments', True) else None,
+            signature=signature,
+            source_code=source_code,
+            decorators=[],  # C++ doesn't have decorators like Python
+            arguments=arguments,
+            return_annotation=return_type,
+            is_async=False,  # C++ functions are not async in the Python sense
+            is_generator=False,  # C++ doesn't have generators like Python
+            language=self.language,
+            namespace="::".join(namespaces) if namespaces and self.parsing_config.get('extract_namespaces', True) else None,
+            template_parameters=template if self.parsing_config.get('extract_templates', True) else None,
+            commit_hash=commit_info.get('commit_hash'),
+            commit_date=commit_info.get('commit_date'),
+            commit_author=commit_info.get('commit_author'),
+            commit_message=commit_info.get('commit_message')
+        )
+    
+    def _determine_function_type(self, name: str, class_name: Optional[str], modifiers: str) -> str:
+        """Determine the type of C++ function."""
+        if class_name:
+            if name == class_name:
+                return 'constructor'
+            elif name.startswith('~'):
+                return 'destructor'
+            elif 'static' in modifiers:
+                return 'staticmethod'
+            else:
+                return 'method'
+        else:
+            return 'function'
+    
+    def _parse_cpp_parameters(self, params: str) -> List[str]:
+        """Parse C++ function parameters."""
+        if not params.strip():
+            return []
+        
+        arguments = []
+        param_list = params.split(',')
+        
+        for param in param_list:
+            param = param.strip()
+            if param:
+                # Extract just the parameter name (last word usually)
+                parts = param.split()
+                if parts:
+                    # Handle cases like "int* ptr", "const std::string& str"
+                    name = parts[-1].lstrip('*&')
+                    arguments.append(name)
+        
+        return arguments
+    
+    def _extract_cpp_documentation(self, lines: List[str], function_line: int) -> Optional[str]:
+        """Extract documentation comments preceding a function."""
+        if not self.parsing_config.get('extract_comments', True):
+            return None
+        
+        doc_lines = []
+        line_idx = function_line - 2  # Start one line before function
+        
+        # Look backwards for documentation comments
+        while line_idx >= 0:
+            line = lines[line_idx].strip()
+            if line.startswith('///') or line.startswith('/**') or line.startswith('*'):
+                # Documentation comment
+                clean_line = line.lstrip('/*').lstrip('*').rstrip('*/').strip()
+                if clean_line:
+                    doc_lines.insert(0, clean_line)
+            elif line.startswith('//'):
+                # Regular comment - might be documentation
+                clean_line = line.lstrip('/').strip()
+                if clean_line:
+                    doc_lines.insert(0, clean_line)
+            elif line == '':
+                # Empty line - continue looking
+                pass
+            else:
+                # Non-comment line - stop looking
+                break
+            line_idx -= 1
+        
+        return '\n'.join(doc_lines) if doc_lines else None
+    
+    def _is_function_modified_in_year(self, file_path: str, start_line: int, end_line: int, 
+                                     year: int, git_cache: 'GitCache') -> bool:
+        """Check if a function was modified in the specified year."""
+        relative_path = os.path.relpath(file_path, git_cache.repo_path)
+        relative_path_normalized = relative_path.replace(os.sep, '/')
+        
+        if not git_cache.is_file_modified_in_year(relative_path_normalized, year):
+            return False
+        
+        try:
+            result = subprocess.run(
+                ['git', 'log', '--format=%H', f'--since={year}-01-01', f'--until={year}-12-31', 
+                 '-L', f'{start_line},{end_line}:{relative_path_normalized}'],
+                cwd=git_cache.repo_path,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            
+            return bool(result.stdout.strip())
+            
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"Error checking if C++ function was modified in {year}: {e}")
+            return False
+
+
+class CodeExtractor:
+    """Extracts functions and methods from source files using language-specific parsers."""
+    
+    def __init__(self, repo_path: str = ".", max_workers: int = None, config: Dict[str, Any] = None):
         self.repo_path = Path(repo_path).resolve()
         self.original_repo_path = self.repo_path  # Store the original path
         self.functions = []
@@ -232,8 +864,38 @@ class CodeExtractor:
         self.max_workers = max_workers or min(32, (os.cpu_count() or 1) + 4)
         self.git_cache = GitCache(str(self.original_repo_path))
         self.metrics = PerformanceMetrics()
-        self._ast_cache = {}  # Cache parsed ASTs
         self._file_content_cache = {}  # Cache file contents
+        
+        # Initialize language configuration and parsers
+        self.config = config or {}
+        self._initialize_parsers()
+        
+    def _initialize_parsers(self):
+        """Initialize language-specific parsers based on configuration."""
+        self.parsers = {}
+        enabled_languages = self.config.get('languages', {}).get('enabled', ['python'])
+        
+        # Create parsers for enabled languages
+        if 'python' in enabled_languages:
+            self.parsers['python'] = PythonParser(self.config)
+        if 'cpp' in enabled_languages:
+            self.parsers['cpp'] = CppParser(self.config)
+        
+        # Build file extension to parser mapping
+        self.extension_to_parser = {}
+        for parser in self.parsers.values():
+            for ext in parser.extensions:
+                self.extension_to_parser[ext] = parser
+        
+        logger.info(f"Initialized parsers for languages: {list(self.parsers.keys())}")
+        logger.info(f"Supported extensions: {list(self.extension_to_parser.keys())}")
+    
+    def get_parser_for_file(self, file_path: str) -> Optional[BaseParser]:
+        """Get the appropriate parser for a file based on its extension."""
+        for ext, parser in self.extension_to_parser.items():
+            if file_path.endswith(ext):
+                return parser
+        return None
         
     def get_last_commit_of_year(self, year: int) -> Optional[str]:
         """Get the last commit hash of a specific year."""
@@ -583,250 +1245,42 @@ class CodeExtractor:
             logger.warning(f"Error checking if function was modified in {year}: {e}")
             return False
     
-    def extract_docstring(self, node: ast.AST) -> Optional[str]:
-        """Extract docstring from AST node."""
-        if isinstance(node, ast.FunctionDef) or isinstance(node, ast.AsyncFunctionDef):
-            if (node.body and isinstance(node.body[0], ast.Expr) and 
-                isinstance(node.body[0].value, ast.Constant) and 
-                isinstance(node.body[0].value.value, str)):
-                return node.body[0].value.value.strip()
-        return None
+
     
-    def get_decorators(self, node: ast.AST) -> List[str]:
-        """Extract decorator names from AST node."""
-        decorators = []
-        for decorator in node.decorator_list:
-            try:
-                if isinstance(decorator, ast.Name):
-                    decorators.append(decorator.id)
-                elif isinstance(decorator, ast.Attribute):
-                    # Handle nested attributes like module.submodule.function
-                    attr_parts = []
-                    current = decorator
-                    while isinstance(current, ast.Attribute):
-                        attr_parts.insert(0, current.attr)
-                        current = current.value
-                    if isinstance(current, ast.Name):
-                        attr_parts.insert(0, current.id)
-                    else:
-                        # If we can't resolve the full path, just use the attribute name
-                        attr_parts = [decorator.attr]
-                    decorators.append(".".join(attr_parts))
-                elif isinstance(decorator, ast.Call):
-                    if isinstance(decorator.func, ast.Name):
-                        decorators.append(decorator.func.id)
-                    elif isinstance(decorator.func, ast.Attribute):
-                        # Handle nested attributes in function calls
-                        attr_parts = []
-                        current = decorator.func
-                        while isinstance(current, ast.Attribute):
-                            attr_parts.insert(0, current.attr)
-                            current = current.value
-                        if isinstance(current, ast.Name):
-                            attr_parts.insert(0, current.id)
-                        else:
-                            attr_parts = [decorator.func.attr]
-                        decorators.append(".".join(attr_parts))
-            except Exception as e:
-                # If we can't parse the decorator, skip it
-                logger.debug(f"Could not parse decorator: {e}")
-                continue
-        return decorators
+
     
-    def get_arguments(self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> List[str]:
-        """Extract function arguments."""
-        args = []
-        
-        # Positional arguments
-        for arg in node.args.args:
-            args.append(arg.arg)
-        
-        # Keyword-only arguments
-        for arg in node.args.kwonlyargs:
-            args.append(f"*{arg.arg}")
-        
-        # Varargs
-        if node.args.vararg:
-            args.append(f"*{node.args.vararg.arg}")
-        
-        # Kwargs
-        if node.args.kwarg:
-            args.append(f"**{node.args.kwarg.arg}")
-        
-        return args
-    
-    def get_return_annotation(self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> Optional[str]:
-        """Extract return annotation."""
-        if node.returns:
-            return ast.unparse(node.returns)
-        return None
-    
-    def get_source_code(self, file_path: str, start_line: int, end_line: int) -> str:
-        """Extract source code for a specific line range."""
-        # Use cached file content if available
-        if file_path not in self._file_content_cache:
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    self._file_content_cache[file_path] = f.readlines()
-            except (UnicodeDecodeError, IOError) as e:
-                logger.warning(f"Error reading file {file_path}: {e}")
-                return ""
-        
-        lines = self._file_content_cache[file_path]
-        return ''.join(lines[start_line-1:end_line])
-    
-    def visit_function(self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef], 
-                      file_path: str, class_name: Optional[str] = None, target_year: Optional[int] = None) -> Optional[FunctionInfo]:
-        """Extract information from a function or method."""
-        # Check if function was modified in target year AS EARLY AS POSSIBLE
-        if target_year:
-            try:
-                was_modified_in_year = self.is_function_modified_in_year(
-                    file_path, node.lineno, node.end_lineno, target_year
-                )
-                
-                # If we're filtering by year and function wasn't modified, skip it immediately
-                if not was_modified_in_year:
-                    self.skipped_functions_count += 1
-                    relative_path = os.path.relpath(file_path, self.repo_path).replace(os.sep, '/')
-                    func_name = f"{class_name}.{node.name}" if class_name else node.name
-                    logger.debug(f"SKIPPED: {func_name} in {relative_path}:{node.lineno} (not modified in {target_year})")
-                    return None
-                else:
-                    relative_path = os.path.relpath(file_path, self.repo_path).replace(os.sep, '/')
-                    func_name = f"{class_name}.{node.name}" if class_name else node.name
-                    logger.debug(f"PROCESSING: {func_name} in {relative_path}:{node.lineno} (modified in {target_year})")
-            except Exception as e:
-                logger.warning(f"Error checking if function {node.name} was modified in {file_path}: {e}")
-                # Continue processing if we can't determine modification status
-        
-        # Record function found
-        self.metrics.record_function_found()
-        
-        # Determine function type
-        decorators = self.get_decorators(node)
-        if class_name:
-            if 'classmethod' in decorators:
-                function_type = 'class_method'
-            elif 'staticmethod' in decorators:
-                function_type = 'staticmethod'
-            else:
-                function_type = 'method'
-        else:
-            function_type = 'function'
-        
-        # Extract information efficiently
-        docstring = self.extract_docstring(node)
-        arguments = self.get_arguments(node)
-        return_annotation = self.get_return_annotation(node)
-        is_async = isinstance(node, ast.AsyncFunctionDef)
-        is_generator = isinstance(node, ast.FunctionDef) and node.returns is None
-        
-        # Get source code using cache
-        source_code = self.get_source_code(file_path, node.lineno, node.end_lineno)
-        
-        # Get git commit information using cache
-        commit_info = {}
-        try:
-            # Get commit info for the function's first line
-            commit_info = self.get_file_commit_info(file_path, node.lineno)
-        except Exception as e:
-            logger.warning(f"Error getting git info for function {node.name} in {file_path}: {e}")
-        
-        return FunctionInfo(
-            name=node.name,
-            file_path=str(file_path),
-            line_number=node.lineno,
-            end_line=node.end_lineno,
-            function_type=function_type,
-            class_name=class_name,
-            docstring=docstring,
-            signature=ast.unparse(node),
-            source_code=source_code,
-            decorators=decorators,
-            arguments=arguments,
-            return_annotation=return_annotation,
-            is_async=is_async,
-            is_generator=is_generator,
-            commit_hash=commit_info.get('commit_hash'),
-            commit_date=commit_info.get('commit_date'),
-            commit_author=commit_info.get('commit_author'),
-            commit_message=commit_info.get('commit_message')
-        )
-    
-    def visit_class(self, node: ast.ClassDef, file_path: str, target_year: Optional[int] = None):
-        """Visit class and extract its methods."""
-        for item in node.body:
-            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                try:
-                    function_info = self.visit_function(item, file_path, node.name, target_year)
-                    if function_info:  # Only append if function_info is not None (i.e., not filtered out)
-                        self.functions.append(function_info)
-                except Exception as e:
-                    logger.warning(f"Error processing method {item.name} in class {node.name} in {file_path}: {e}")
-                    continue
-    
-    def visit_class_optimized(self, node: ast.ClassDef, file_path: str, target_year: Optional[int] = None) -> List[FunctionInfo]:
-        """Visit class and extract its methods - optimized version that returns functions."""
-        class_functions = []
-        for item in node.body:
-            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                try:
-                    function_info = self.visit_function(item, file_path, node.name, target_year)
-                    if function_info:
-                        class_functions.append(function_info)
-                except Exception as e:
-                    logger.warning(f"Error processing method {item.name} in class {node.name} in {file_path}: {e}")
-                    continue
-        return class_functions
+
     
     def visit_file(self, file_path: str, target_year: Optional[int] = None) -> List[FunctionInfo]:
-        """Parse a Python file and extract all functions and methods."""
+        """Parse a source file and extract all functions and methods using appropriate parser."""
         file_start_time = time.time()
         file_functions = []
         
         try:
-            # Use cached AST if available
-            if file_path not in self._ast_cache:
-                if file_path not in self._file_content_cache:
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                        self._file_content_cache[file_path] = content.splitlines(keepends=True)
-                else:
-                    content = ''.join(self._file_content_cache[file_path])
-                
-                self._ast_cache[file_path] = ast.parse(content)
+            # Get the appropriate parser for this file
+            parser = self.get_parser_for_file(file_path)
+            if not parser:
+                logger.debug(f"No parser available for file: {file_path}")
+                return []
             
-            tree = self._ast_cache[file_path]
+            # Read file content (with caching)
+            if file_path not in self._file_content_cache:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    self._file_content_cache[file_path] = content
+            else:
+                content = self._file_content_cache[file_path]
             
-            # More efficient node processing - avoid multiple ast.walk calls
-            for node in tree.body:
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    # Top-level function
-                    try:
-                        function_info = self.visit_function(node, file_path, target_year=target_year)
-                        if function_info:
-                            file_functions.append(function_info)
-                    except Exception as e:
-                        logger.warning(f"Error processing function {node.name} in {file_path}: {e}")
-                        continue
-                
-                elif isinstance(node, ast.ClassDef):
-                    try:
-                        class_functions = self.visit_class_optimized(node, file_path, target_year)
-                        file_functions.extend(class_functions)
-                    except Exception as e:
-                        logger.warning(f"Error processing class {node.name} in {file_path}: {e}")
-                        continue
+            # Use the appropriate parser to extract functions
+            file_functions = parser.extract_functions(file_path, content, self.git_cache, target_year)
             
             # Record performance metrics
             processing_time = time.time() - file_start_time
             self.metrics.record_file_processed(processing_time)
             
+            logger.debug(f"Processed {file_path} with {parser.language} parser: found {len(file_functions)} functions")
             return file_functions
                     
-        except SyntaxError as e:
-            logger.warning(f"Syntax error in {file_path}: {e}")
         except UnicodeDecodeError as e:
             logger.warning(f"Encoding error in {file_path}: {e}")
         except Exception as e:
@@ -839,17 +1293,19 @@ class CodeExtractor:
         logger.info(f"Scanning repository: {self.repo_path} with {self.max_workers} workers")
         
         try:
-            # Find all Python files efficiently
-            python_files = []
+            # Find all supported source files efficiently
+            source_files = []
+            supported_extensions = list(self.extension_to_parser.keys())
+            
             for root, dirs, files in os.walk(self.repo_path):
                 # Skip common directories to ignore
                 dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ['__pycache__', 'node_modules', '.git']]
                 
                 for file in files:
-                    if file.endswith('.py'):
-                        python_files.append(os.path.join(root, file))
+                    if any(file.endswith(ext) for ext in supported_extensions):
+                        source_files.append(os.path.join(root, file))
             
-            logger.info(f"Found {len(python_files)} Python files")
+            logger.info(f"Found {len(source_files)} source files with extensions: {supported_extensions}")
             
             # If filtering by year, pre-cache modified files for the entire year
             if year:
@@ -860,8 +1316,8 @@ class CodeExtractor:
             logger.info(f"Processing files with {self.max_workers} parallel workers...")
             all_functions = []
             
-            if len(python_files) < 10:  # For small repos, don't use parallel processing
-                for file_path in python_files:
+            if len(source_files) < 10:  # For small repos, don't use parallel processing
+                for file_path in source_files:
                     logger.debug(f"Processing: {file_path}")
                     file_functions = self.visit_file(file_path, target_year=year)
                     all_functions.extend(file_functions)
@@ -871,7 +1327,7 @@ class CodeExtractor:
                     # Submit all file processing tasks
                     future_to_file = {
                         executor.submit(self.visit_file, file_path, year): file_path 
-                        for file_path in python_files
+                        for file_path in source_files
                     }
                     
                     # Collect results as they complete
@@ -913,7 +1369,6 @@ class CodeExtractor:
         self.functions = []
         self.skipped_functions_count = 0
         # Clear caches to free memory
-        self._ast_cache.clear()
         self._file_content_cache.clear()
         self.git_cache.clear_cache()
         self.metrics = PerformanceMetrics()
@@ -922,7 +1377,6 @@ class CodeExtractor:
     def get_memory_usage(self) -> Dict[str, int]:
         """Get current memory usage of caches."""
         return {
-            'ast_cache_entries': len(self._ast_cache),
             'file_content_cache_entries': len(self._file_content_cache),
             'git_blame_cache_entries': len(self.git_cache.file_blame_cache),
             'git_modified_files_cache_entries': len(self.git_cache.modified_files_cache)
@@ -999,6 +1453,9 @@ class DuckDBManager:
                 return_annotation VARCHAR,
                 is_async BOOLEAN NOT NULL,
                 is_generator BOOLEAN NOT NULL,
+                language VARCHAR NOT NULL DEFAULT 'python',
+                namespace VARCHAR,
+                template_parameters TEXT,
                 commit_hash VARCHAR,
                 commit_date VARCHAR,
                 commit_author VARCHAR,
@@ -1023,6 +1480,7 @@ class DuckDBManager:
         self.conn.execute(f"CREATE INDEX IF NOT EXISTS {self._get_index_name('functions_name')} ON {functions_table}(name)")
         self.conn.execute(f"CREATE INDEX IF NOT EXISTS {self._get_index_name('functions_file_path')} ON {functions_table}(file_path)")
         self.conn.execute(f"CREATE INDEX IF NOT EXISTS {self._get_index_name('functions_type')} ON {functions_table}(function_type)")
+        self.conn.execute(f"CREATE INDEX IF NOT EXISTS {self._get_index_name('functions_language')} ON {functions_table}(language)")
         self.conn.execute(f"CREATE INDEX IF NOT EXISTS {self._get_index_name('functions_commit_hash')} ON {functions_table}(commit_hash)")
         
         logger.info(f"Database tables created successfully for {self.repo_name}_{self.year}")
@@ -1067,6 +1525,9 @@ class DuckDBManager:
                         func.return_annotation,
                         func.is_async,
                         func.is_generator,
+                        func.language,
+                        func.namespace,
+                        func.template_parameters,
                         func.commit_hash,
                         func.commit_date,
                         func.commit_author,
@@ -1078,9 +1539,9 @@ class DuckDBManager:
                     INSERT INTO {functions_table} (
                         name, file_path, line_number, end_line, function_type, class_name,
                         docstring, signature, source_code, decorators, arguments, return_annotation,
-                        is_async, is_generator, commit_hash, commit_date,
-                        commit_author, commit_message
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        is_async, is_generator, language, namespace, template_parameters,
+                        commit_hash, commit_date, commit_author, commit_message
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, data)
                 
                 logger.debug(f"Inserted batch {i//batch_size + 1}/{(len(functions) + batch_size - 1)//batch_size}")
@@ -1361,7 +1822,7 @@ def main():
     except:
         optimal_workers = 8  # Default fallback
     
-    extractor = CodeExtractor(repo_path, max_workers=optimal_workers)
+    extractor = CodeExtractor(repo_path, max_workers=optimal_workers, config=config)
     
     # Verify this is a git repository (one-time check)
     try:
