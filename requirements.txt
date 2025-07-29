@@ -20,13 +20,14 @@ tqdm
 loguru
 
 # Code parsing
-tree-sitter
+tree-sitter>=0.23.2
+tree-sitter-c>=0.23.2
 
 # Web requests (for API calls)
 requests
 
 # Configuration
-PyYAML
+PyYAML>=6.0
 
 # Database
-duckdb
+duckdb>=0.9.0
