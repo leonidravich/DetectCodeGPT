@@ -1847,6 +1847,8 @@ def main():
     repo_path = config.get('repository', {}).get('path', '.')
     repo_name = config.get('repository', {}).get('name', 'default')
     year = config.get('repository', {}).get('year', datetime.now().year)
+    start_year = config.get('repository', {}).get('start_year')
+    end_year = config.get('repository', {}).get('end_year')
     search = config.get('repository', {}).get('search')
     stats = config.get('repository', {}).get('stats', False)
     
@@ -1888,17 +1890,42 @@ def main():
     
     # Get all years with commits
     git_info = extractor.get_git_info()
-    first_year = git_info.get('first_commit_year')
-    last_year = git_info.get('last_commit_year')
+    git_first_year = git_info.get('first_commit_year')
+    git_last_year = git_info.get('last_commit_year')
     
-    if not first_year or not last_year:
+    if not git_first_year or not git_last_year:
         raise Exception("Could not determine repository commit years")
+    
+    # Determine processing year range based on configuration
+    if start_year is not None and end_year is not None:
+        # Both start and end years are configured
+        if start_year > end_year:
+            raise Exception(f"Invalid year range: start_year ({start_year}) cannot be greater than end_year ({end_year})")
+        first_year = max(start_year, git_first_year)
+        last_year = min(end_year, git_last_year)
+        year_source = "configured"
+    elif start_year is not None:
+        # Only start year is configured
+        first_year = max(start_year, git_first_year)
+        last_year = git_last_year
+        year_source = "configured start year"
+    elif end_year is not None:
+        # Only end year is configured
+        first_year = git_first_year
+        last_year = min(end_year, git_last_year)
+        year_source = "configured end year"
+    else:
+        # Use git-detected range (default behavior)
+        first_year = git_first_year
+        last_year = git_last_year
+        year_source = "git-detected"
     
     print(f"\n=== Git Repository Information ===")
     print(f"Repository: {repo_name}")
     print(f"Path: {repo_path}")
-    print(f"First commit year: {first_year}")
-    print(f"Last commit year: {last_year}")
+    print(f"Git first commit year: {git_first_year}")
+    print(f"Git last commit year: {git_last_year}")
+    print(f"Processing year range: {first_year} to {last_year} ({year_source})")
     print(f"Years to process: {last_year - first_year + 1}")
     
     # Process each year

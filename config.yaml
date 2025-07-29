@@ -10,9 +10,11 @@ database:
 
 # Repository Configuration (for folder_lader.py)
 repository:
-  path: "D:/kernel/linux"
+  path: "."  # Current directory
   name: "detectcodegpt"  # Repository name for table naming
   year: 2025  # Year for table naming (defaults to current year if not specified)
+  start_year: null  # Optional: start year for processing range (null = auto-detect from git)
+  end_year: null    # Optional: end year for processing range (null = auto-detect from git)
   search: null  # Search query for functions
   stats: false  # Show database statistics
   git:
