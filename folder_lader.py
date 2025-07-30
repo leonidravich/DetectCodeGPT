@@ -59,11 +59,15 @@ class GitCache:
             self.modified_files_cache.clear()
             logger.info(f"GitCache repo_path updated to: {new_repo_path}")
         
-    def batch_get_modified_files_in_year(self, year: int) -> Set[str]:
+    def batch_get_modified_files_in_year(self, year: int, supported_extensions: List[str] = None) -> Set[str]:
         """Get all files modified in a specific year in one git operation."""
         cache_key = f"modified_files_{year}"
         if cache_key in self.modified_files_cache:
             return self.modified_files_cache[cache_key]
+            
+        # Default to Python files if no extensions provided (backward compatibility)
+        if supported_extensions is None:
+            supported_extensions = ['.py']
             
         try:
             result = subprocess.run(
@@ -76,11 +80,11 @@ class GitCache:
             
             modified_files = set()
             for line in result.stdout.strip().split('\n'):
-                if line.strip() and line.endswith('.py'):
+                if line.strip() and any(line.strip().endswith(ext) for ext in supported_extensions):
                     modified_files.add(line.strip())
             
             self.modified_files_cache[cache_key] = modified_files
-            logger.info(f"Cached {len(modified_files)} modified Python files for year {year}")
+            logger.info(f"Cached {len(modified_files)} modified files for year {year} (extensions: {supported_extensions})")
             return modified_files
             
         except subprocess.CalledProcessError as e:
@@ -143,9 +147,9 @@ class GitCache:
         blame_data = self.batch_get_file_blame(file_path)
         return blame_data.get(line_number, {})
     
-    def is_file_modified_in_year(self, file_path: str, year: int) -> bool:
+    def is_file_modified_in_year(self, file_path: str, year: int, supported_extensions: List[str] = None) -> bool:
         """Check if file was modified in year using cached data."""
-        modified_files = self.batch_get_modified_files_in_year(year)
+        modified_files = self.batch_get_modified_files_in_year(year, supported_extensions)
         return file_path in modified_files
     
     def clear_cache(self):
@@ -218,9 +222,9 @@ class FunctionInfo:
     return_annotation: Optional[str]
     is_async: bool
     is_generator: bool
-    language: str  # Programming language: 'python', 'cpp'
-    namespace: Optional[str] = None  # For C++ namespaces
-    template_parameters: Optional[str] = None  # For C++ templates
+    language: str  # Programming language: 'python', 'c'
+    namespace: Optional[str] = None  # For C namespaces (not used in C)
+    template_parameters: Optional[str] = None  # For C templates (not used in C)
     # Git commit metadata
     commit_hash: Optional[str] = None
     commit_date: Optional[str] = None
@@ -477,7 +481,7 @@ class PythonParser(BaseParser):
         relative_path = os.path.relpath(file_path, git_cache.repo_path)
         relative_path_normalized = relative_path.replace(os.sep, '/')
         
-        if not git_cache.is_file_modified_in_year(relative_path_normalized, year):
+        if not git_cache.is_file_modified_in_year(relative_path_normalized, year, self.extensions):
             return False
         
         try:
@@ -497,8 +501,11 @@ class PythonParser(BaseParser):
             return False
 
 
-class CppParser(BaseParser):
-    """Parser for C/C++ files using Tree-sitter parsing."""
+
+
+
+class CParser(BaseParser):
+    """Parser for C files using Tree-sitter parsing."""
     
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
@@ -507,40 +514,40 @@ class CppParser(BaseParser):
         self._initialize_tree_sitter()
     
     def _initialize_tree_sitter(self):
-        """Initialize Tree-sitter parser for C++ using pre-built package."""
+        """Initialize Tree-sitter parser for C using pre-built package."""
         try:
             # Create parser
             self.parser = tree_sitter.Parser()
             
-            # Import and use the pre-built tree-sitter-cpp package
+            # Import and use the pre-built tree-sitter-c package
             try:
-                import tree_sitter_cpp
+                import tree_sitter_c
                 
                 # Create Language object using the correct pattern from working example
-                self.language = Language(tree_sitter_cpp.language())
+                self.language = Language(tree_sitter_c.language())
                 self.parser.language = self.language
-                logger.info("Tree-sitter C++ parser initialized successfully using pre-built package")
+                logger.info("Tree-sitter C parser initialized successfully using pre-built package")
                 
             except ImportError:
-                logger.error("tree-sitter-cpp not installed")
-                raise RuntimeError("tree-sitter-cpp not installed. Install with: pip install tree-sitter-cpp")
+                logger.error("tree-sitter-c not installed")
+                raise RuntimeError("tree-sitter-c not installed. Install with: pip install tree-sitter-c")
             except Exception as e:
-                logger.error(f"Failed to load C++ language: {e}")
-                raise RuntimeError(f"C++ language not available: {e}")
+                logger.error(f"Failed to load C language: {e}")
+                raise RuntimeError(f"C language not available: {e}")
                 
         except Exception as e:
             logger.error(f"Failed to initialize Tree-sitter parser: {e}")
             raise RuntimeError(f"Tree-sitter parser initialization failed: {e}")
     
     def _get_language_name(self) -> str:
-        return "cpp"
+        return "c"
     
     def _get_file_extensions(self) -> List[str]:
-        return self.config.get('languages', {}).get('extensions', {}).get('cpp', ['.cpp', '.cxx', '.cc', '.c', '.hpp', '.hxx', '.h'])
+        return self.config.get('languages', {}).get('extensions', {}).get('c', ['.c', '.h'])
     
     def extract_functions(self, file_path: str, file_content: str, git_cache: 'GitCache', 
                          target_year: Optional[int] = None) -> List[FunctionInfo]:
-        """Extract functions from C/C++ file using Tree-sitter parsing."""
+        """Extract functions from C file using Tree-sitter parsing."""
         functions = []
         
         try:
@@ -548,50 +555,25 @@ class CppParser(BaseParser):
             tree = self.parser.parse(file_content.encode('utf-8'))
             root_node = tree.root_node
             
-            # Extract namespace context
-            namespaces = self._extract_namespaces_tree_sitter(root_node)
-            
             # Extract functions
             function_nodes = self._find_function_nodes_tree_sitter(root_node)
             
             for func_node in function_nodes:
                 try:
                     function_info = self._create_function_info_tree_sitter(
-                        func_node, file_path, file_content, git_cache, 
-                        namespaces, target_year
+                        func_node, file_path, file_content, git_cache, target_year
                     )
                     if function_info:
                         functions.append(function_info)
                 except Exception as e:
-                    logger.warning(f"Error processing C++ function with Tree-sitter in {file_path}: {e}")
+                    logger.warning(f"Error processing C function with Tree-sitter in {file_path}: {e}")
                     continue
-            
-            # Extract class member functions
-            class_nodes = self._find_class_nodes_tree_sitter(root_node)
-            for class_node in class_nodes:
-                class_functions = self._extract_class_members_tree_sitter(
-                    class_node, file_path, file_content, git_cache, 
-                    namespaces, target_year
-                )
-                functions.extend(class_functions)
             
             return functions
             
         except Exception as e:
             logger.error(f"Tree-sitter parsing failed for {file_path}: {e}")
             raise
-    
-    def _extract_namespaces_tree_sitter(self, root_node):
-        """Extract namespace context using Tree-sitter."""
-        namespaces = []
-        for node in root_node.children:
-            if node.type == 'namespace_definition':
-                # Extract namespace name from the node
-                for child in node.children:
-                    if child.type == 'namespace_identifier':
-                        namespaces.append(child.text.decode('utf-8'))
-                        break
-        return namespaces
     
     def _find_function_nodes_tree_sitter(self, root_node):
         """Find function definition nodes using Tree-sitter."""
@@ -606,56 +588,9 @@ class CppParser(BaseParser):
         find_functions_recursive(root_node)
         return function_nodes
     
-    def _find_class_nodes_tree_sitter(self, root_node):
-        """Find class/struct definition nodes using Tree-sitter."""
-        class_nodes = []
-        
-        def find_classes_recursive(node):
-            if node.type in ['class_definition', 'struct_definition']:
-                class_nodes.append(node)
-            for child in node.children:
-                find_classes_recursive(child)
-        
-        find_classes_recursive(root_node)
-        return class_nodes
-    
-    def _extract_class_members_tree_sitter(self, class_node, file_path: str, 
-                                     file_content: str, git_cache: 'GitCache',
-                                     namespaces: List[str], target_year: Optional[int] = None) -> List[FunctionInfo]:
-        """Extract member functions from a class using Tree-sitter."""
-        members = []
-        class_name = None
-        
-        # Extract class name
-        for child in class_node.children:
-            if child.type == 'type_identifier':
-                class_name = child.text.decode('utf-8')
-                break
-        
-        if not class_name:
-            return members
-        
-        # Find member functions within the class
-        member_functions = self._find_function_nodes_tree_sitter(class_node)
-        
-        for func_node in member_functions:
-            try:
-                function_info = self._create_function_info_tree_sitter(
-                    func_node, file_path, file_content, git_cache,
-                    namespaces, target_year, class_name
-                )
-                if function_info:
-                    members.append(function_info)
-            except Exception as e:
-                logger.warning(f"Error processing C++ class member function with Tree-sitter in {file_path}: {e}")
-                continue
-        
-        return members
-    
     def _create_function_info_tree_sitter(self, func_node, file_path: str, 
                                     file_content: str, git_cache: 'GitCache',
-                                    namespaces: List[str], target_year: Optional[int] = None,
-                                    class_name: Optional[str] = None) -> Optional[FunctionInfo]:
+                                    target_year: Optional[int] = None) -> Optional[FunctionInfo]:
         """Create FunctionInfo from a Tree-sitter node."""
         try:
             # Extract function details from Tree-sitter node
@@ -676,34 +611,26 @@ class CppParser(BaseParser):
                     if not was_modified_in_year:
                         return None
                 except Exception as e:
-                    logger.warning(f"Error checking if C++ function was modified: {e}")
+                    logger.warning(f"Error checking if C function was modified: {e}")
             
             # Extract function details
             return_type = self._extract_return_type_tree_sitter(func_node)
             parameters = self._extract_parameters_tree_sitter(func_node)
-            template_params = self._extract_template_parameters_tree_sitter(func_node)
-            modifiers = self._extract_modifiers_tree_sitter(func_node)
             
-            # Determine function type
-            function_type = self._determine_function_type(function_name, class_name, modifiers)
+            # Determine function type (C only has functions, no classes/methods)
+            function_type = 'function'
             
             # Build signature
-            signature_parts = []
-            if template_params:
-                signature_parts.append(f"template<{template_params}>")
-            if modifiers:
-                signature_parts.append(modifiers)
-            signature_parts.extend([return_type, f"{function_name}({parameters})"])
-            signature = " ".join(signature_parts)
+            signature = f"{return_type} {function_name}({parameters})"
             
             # Extract arguments
-            arguments = self._parse_cpp_parameters(parameters)
+            arguments = self._parse_c_parameters(parameters)
             
             # Get source code
             source_code = func_node.text.decode('utf-8')
             
             # Extract documentation comment
-            docstring = self._extract_cpp_documentation_tree_sitter(file_content, start_line)
+            docstring = self._extract_c_documentation_tree_sitter(file_content, start_line)
             
             # Get git commit information
             commit_info = self.get_commit_info(file_path, start_line, git_cache)
@@ -714,18 +641,18 @@ class CppParser(BaseParser):
                 line_number=start_line,
                 end_line=end_line,
                 function_type=function_type,
-                class_name=class_name,
+                class_name=None,  # C doesn't have classes
                 docstring=docstring if self.parsing_config.get('extract_comments', True) else None,
                 signature=signature,
                 source_code=source_code,
-                decorators=[],  # C++ doesn't have decorators like Python
+                decorators=[],  # C doesn't have decorators
                 arguments=arguments,
                 return_annotation=return_type,
-                is_async=False,  # C++ functions are not async in the Python sense
-                is_generator=False,  # C++ doesn't have generators like Python
+                is_async=False,  # C functions are not async
+                is_generator=False,  # C doesn't have generators
                 language=self._get_language_name(),
-                namespace="::".join(namespaces) if namespaces and self.parsing_config.get('extract_namespaces', True) else None,
-                template_parameters=template_params if self.parsing_config.get('extract_templates', True) else None,
+                namespace=None,  # C doesn't have namespaces like C++
+                template_parameters=None,  # C doesn't have templates
                 commit_hash=commit_info.get('commit_hash'),
                 commit_date=commit_info.get('commit_date'),
                 commit_author=commit_info.get('commit_author'),
@@ -761,22 +688,7 @@ class CppParser(BaseParser):
                         return grandchild.text.decode('utf-8')
         return ""
     
-    def _extract_template_parameters_tree_sitter(self, func_node):
-        """Extract template parameters from Tree-sitter node."""
-        for child in func_node.children:
-            if child.type == 'template_declaration':
-                return child.text.decode('utf-8')
-        return None
-    
-    def _extract_modifiers_tree_sitter(self, func_node):
-        """Extract function modifiers from Tree-sitter node."""
-        modifiers = []
-        for child in func_node.children:
-            if child.type in ['storage_class_specifier', 'function_specifier']:
-                modifiers.append(child.text.decode('utf-8'))
-        return " ".join(modifiers)
-    
-    def _extract_cpp_documentation_tree_sitter(self, file_content: str, function_line: int) -> Optional[str]:
+    def _extract_c_documentation_tree_sitter(self, file_content: str, function_line: int) -> Optional[str]:
         """Extract documentation comments preceding a function using Tree-sitter."""
         if not self.parsing_config.get('extract_comments', True):
             return None
@@ -808,22 +720,8 @@ class CppParser(BaseParser):
         
         return '\n'.join(doc_lines) if doc_lines else None
     
-    def _determine_function_type(self, name: str, class_name: Optional[str], modifiers: str) -> str:
-        """Determine the type of C++ function."""
-        if class_name:
-            if name == class_name:
-                return 'constructor'
-            elif name.startswith('~'):
-                return 'destructor'
-            elif 'static' in modifiers:
-                return 'staticmethod'
-            else:
-                return 'method'
-        else:
-            return 'function'
-    
-    def _parse_cpp_parameters(self, params: str) -> List[str]:
-        """Parse C++ function parameters."""
+    def _parse_c_parameters(self, params: str) -> List[str]:
+        """Parse C function parameters."""
         if not params.strip():
             return []
         
@@ -836,42 +734,11 @@ class CppParser(BaseParser):
                 # Extract just the parameter name (last word usually)
                 parts = param.split()
                 if parts:
-                    # Handle cases like "int* ptr", "const std::string& str"
+                    # Handle cases like "int* ptr", "const char* str"
                     name = parts[-1].lstrip('*&')
                     arguments.append(name)
         
         return arguments
-    
-    def _extract_cpp_documentation(self, lines: List[str], function_line: int) -> Optional[str]:
-        """Extract documentation comments preceding a function."""
-        if not self.parsing_config.get('extract_comments', True):
-            return None
-        
-        doc_lines = []
-        line_idx = function_line - 2  # Start one line before function
-        
-        # Look backwards for documentation comments
-        while line_idx >= 0:
-            line = lines[line_idx].strip()
-            if line.startswith('///') or line.startswith('/**') or line.startswith('*'):
-                # Documentation comment
-                clean_line = line.lstrip('/*').lstrip('*').rstrip('*/').strip()
-                if clean_line:
-                    doc_lines.insert(0, clean_line)
-            elif line.startswith('//'):
-                # Regular comment - might be documentation
-                clean_line = line.lstrip('/').strip()
-                if clean_line:
-                    doc_lines.insert(0, clean_line)
-            elif line == '':
-                # Empty line - continue looking
-                pass
-            else:
-                # Non-comment line - stop looking
-                break
-            line_idx -= 1
-        
-        return '\n'.join(doc_lines) if doc_lines else None
     
     def _is_function_modified_in_year(self, file_path: str, start_line: int, end_line: int, 
                                      year: int, git_cache: 'GitCache') -> bool:
@@ -879,7 +746,7 @@ class CppParser(BaseParser):
         relative_path = os.path.relpath(file_path, git_cache.repo_path)
         relative_path_normalized = relative_path.replace(os.sep, '/')
         
-        if not git_cache.is_file_modified_in_year(relative_path_normalized, year):
+        if not git_cache.is_file_modified_in_year(relative_path_normalized, year, self.extensions):
             return False
         
         try:
@@ -895,7 +762,7 @@ class CppParser(BaseParser):
             return bool(result.stdout.strip())
             
         except subprocess.CalledProcessError as e:
-            logger.warning(f"Error checking if C++ function was modified in {year}: {e}")
+            logger.warning(f"Error checking if C function was modified in {year}: {e}")
             return False
 
 
@@ -926,8 +793,8 @@ class CodeExtractor:
         # Create parsers for enabled languages
         if 'python' in enabled_languages:
             self.parsers['python'] = PythonParser(self.config)
-        if 'cpp' in enabled_languages:
-            self.parsers['cpp'] = CppParser(self.config)
+        if 'c' in enabled_languages:
+            self.parsers['c'] = CParser(self.config)
         
         # Build file extension to parser mapping
         self.extension_to_parser = {}
@@ -1264,7 +1131,7 @@ class CodeExtractor:
         # Normalize path separators to forward slashes for git compatibility
         relative_path_normalized = relative_path.replace(os.sep, '/')
         
-        if not self.git_cache.is_file_modified_in_year(relative_path_normalized, year):
+        if not self.git_cache.is_file_modified_in_year(relative_path_normalized, year, list(self.extension_to_parser.keys())):
             self.metrics.record_cache_hit()
             logger.debug(f"FILTERED: File {relative_path_normalized} was not modified in {year}")
             return False
@@ -1358,7 +1225,7 @@ class CodeExtractor:
             # If filtering by year, pre-cache modified files for the entire year
             if year:
                 logger.info(f"Pre-caching modified files for year {year}...")
-                self.git_cache.batch_get_modified_files_in_year(year)
+                self.git_cache.batch_get_modified_files_in_year(year, supported_extensions)
             
             # Process files in parallel
             logger.info(f"Processing files with {self.max_workers} parallel workers...")

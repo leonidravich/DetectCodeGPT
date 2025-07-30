@@ -24,21 +24,17 @@ repository:
 
 # Language Configuration
 languages:
-  enabled: ["python", "cpp"]  # Languages to process: python, cpp
+  enabled: ["python", "c"]  # Languages to process: python, c
   extensions:
     python: [".py"]
-    cpp: [".cpp", ".cxx", ".cc", ".c", ".hpp", ".hxx", ".h"]
+    c: [".c", ".h"]
   parsing:
     python:
       extract_docstrings: true
       extract_decorators: true
       extract_generators: true
-    cpp:
+    c:
       extract_comments: true  # Extract documentation comments
-      extract_templates: true  # Extract template information
-      extract_namespaces: true  # Extract namespace information
-      include_headers: true  # Include header files (.h, .hpp)
-      member_functions_only: false  # If true, only extract member functions
 
 # Function Filtering (for ai_detector.py)
 filtering:
