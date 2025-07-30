@@ -549,7 +549,6 @@ class CParser(BaseParser):
                          target_year: Optional[int] = None) -> List[FunctionInfo]:
         """Extract functions from C file using Tree-sitter parsing."""
         functions = []
-        
         try:
             # Parse the file with Tree-sitter
             tree = self.parser.parse(file_content.encode('utf-8'))
@@ -557,7 +556,8 @@ class CParser(BaseParser):
             
             # Extract functions
             function_nodes = self._find_function_nodes_tree_sitter(root_node)
-            
+            logger.info(f"Found {len(function_nodes)} function nodes in {file_path}")
+
             for func_node in function_nodes:
                 try:
                     function_info = self._create_function_info_tree_sitter(
@@ -597,7 +597,7 @@ class CParser(BaseParser):
             function_name = self._extract_function_name_tree_sitter(func_node)
             if not function_name:
                 return None
-            
+            logger.info(f"Extracting function {function_name} from {file_path}")
             # Get line numbers
             start_line = func_node.start_point[0] + 1
             end_line = func_node.end_point[0] + 1
@@ -609,10 +609,13 @@ class CParser(BaseParser):
                         file_path, start_line, end_line, target_year, git_cache
                     )
                     if not was_modified_in_year:
+                        logger.info(f"Function {function_name} was not modified in {target_year}")
                         return None
                 except Exception as e:
                     logger.warning(f"Error checking if C function was modified: {e}")
-            
+
+                logger.info(f"Extracting function {function_name} from {file_path} in {target_year}")
+
             # Extract function details
             return_type = self._extract_return_type_tree_sitter(func_node)
             parameters = self._extract_parameters_tree_sitter(func_node)
