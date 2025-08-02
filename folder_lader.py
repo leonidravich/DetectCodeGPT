@@ -700,7 +700,7 @@ class CParser(BaseParser):
             
             # Extract functions
             function_nodes = self._find_function_nodes_tree_sitter(root_node)
-            logger.info(f"Found {len(function_nodes)} function nodes in {file_path}")
+            logger.debug(f"Found {len(function_nodes)} function nodes in {file_path}")
 
             for func_node in function_nodes:
                 try:
