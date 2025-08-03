@@ -48,6 +48,7 @@ ai_detection:
   process_all_repos: false  # Process all repositories and years in database
   show_summary: true  # Show summary results per repo/year
   summary_only: false  # Only show summaries without processing (useful for viewing existing results)
+  author_threshold: null  # Custom threshold for author statistics (null = use 99th percentile, float = use custom threshold like 1.5)
 
 # Model Configuration (for ai_detector.py)
 models:

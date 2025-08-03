@@ -508,38 +508,51 @@ class FunctionLoader:
                     summary['score_by_type'] = score_by_type
                     
                     # Author statistics
-                    # First get the 99th percentile score
-                    p99_result = self.conn.execute(f"""
-                        SELECT PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY detectcodegpt_score) as p99_score
-                        FROM {functions_table}
-                        WHERE detectcodegpt_score IS NOT NULL AND commit_author IS NOT NULL
-                    """).fetchone()
-                    
-                    if p99_result and p99_result[0] is not None:
-                        p99_score = p99_result[0]
+                    # Determine threshold to use
+                    if hasattr(self, 'author_threshold') and self.author_threshold is not None:
+                        # Use custom threshold from config
+                        threshold_score = self.author_threshold
+                        threshold_name = f"custom_{self.author_threshold}"
+                    else:
+                        # Use 99th percentile
+                        p99_result = self.conn.execute(f"""
+                            SELECT PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY detectcodegpt_score) as p99_score
+                            FROM {functions_table}
+                            WHERE detectcodegpt_score IS NOT NULL AND commit_author IS NOT NULL
+                        """).fetchone()
                         
-                        # Now get author statistics using the calculated p99_score
+                        if p99_result and p99_result[0] is not None:
+                            threshold_score = p99_result[0]
+                            threshold_name = "p99"
+                        else:
+                            threshold_score = None
+                            threshold_name = "p99"
+                    
+                    if threshold_score is not None:
+                        
+                        # Now get author statistics using the calculated threshold
                         author_result = self.conn.execute(f"""
                             SELECT 
                                 COUNT(DISTINCT commit_author) as total_authors,
                                 COUNT(DISTINCT CASE 
                                     WHEN detectcodegpt_score > ? 
                                     THEN commit_author 
-                                END) as authors_above_p99
+                                END) as authors_above_threshold
                             FROM {functions_table}
                             WHERE detectcodegpt_score IS NOT NULL AND commit_author IS NOT NULL
-                        """, (p99_score,)).fetchone()
+                        """, (threshold_score,)).fetchone()
                         
                         if author_result and author_result[0] > 0:
                             total_authors = author_result[0]
-                            authors_above_p99 = author_result[1]
-                            author_p99_percentage = (authors_above_p99 / total_authors) * 100 if total_authors > 0 else 0
+                            authors_above_threshold = author_result[1]
+                            author_threshold_percentage = (authors_above_threshold / total_authors) * 100 if total_authors > 0 else 0
                             
                             summary['author_statistics'] = {
                                 'total_authors': total_authors,
-                                'authors_above_p99': authors_above_p99,
-                                'p99_score': p99_score,
-                                'author_p99_percentage': author_p99_percentage
+                                'authors_above_threshold': authors_above_threshold,
+                                'threshold_score': threshold_score,
+                                'threshold_name': threshold_name,
+                                'author_threshold_percentage': author_threshold_percentage
                             }
                         else:
                             summary['author_statistics'] = None
@@ -1069,6 +1082,7 @@ def create_args_from_config(config):
             self.process_all_repos = ai_detection.get('process_all_repos', False)
             self.show_summary = ai_detection.get('show_summary', True)
             self.summary_only = ai_detection.get('summary_only', False)
+            self.author_threshold = ai_detection.get('author_threshold', None)
             
             # Model arguments
             self.base_model_name = config.get('models', {}).get('base_model_name', 'codellama/CodeLlama-7b-hf')
@@ -1205,8 +1219,8 @@ def print_repo_year_summaries(summaries: List[Dict[str, Any]]):
         
         # Year-by-year breakdown
         print(f"\nYear-by-Year Results:")
-        print(f"{'Year':<6} {'Functions':<10} {'Files':<8} {'Scored':<8} {'Avg Score':<12} {'Min Score':<12} {'Max Score':<12} {'P90 Score':<12} {'Authors':<8} {'Above P99':<10} {'Status':<10}")
-        print("-" * 130)
+        print(f"{'Year':<6} {'Functions':<10} {'Files':<8} {'Scored':<8} {'Avg Score':<12} {'Min Score':<12} {'Max Score':<12} {'P90 Score':<12} {'Authors':<8} {'Above Thresh':<12} {'Status':<10}")
+        print("-" * 132)
         
         for summary in repo_summaries:
             year = summary['year']
@@ -1217,7 +1231,7 @@ def print_repo_year_summaries(summaries: List[Dict[str, Any]]):
             if summary.get('processing_failed'):
                 status = "FAILED"
                 print(f"{year:<6} {total_funcs:<10} {unique_files:<8} {'0':<8} "
-                      f"{'N/A':<12} {'N/A':<12} {'N/A':<12} {'N/A':<12} {'N/A':<8} {'N/A':<10} {status:<10}")
+                      f"{'N/A':<12} {'N/A':<12} {'N/A':<12} {'N/A':<12} {'N/A':<8} {'N/A':<12} {status:<10}")
                 if summary.get('error'):
                     print(f"    Error: {summary['error']}")
                 continue
@@ -1237,19 +1251,20 @@ def print_repo_year_summaries(summaries: List[Dict[str, Any]]):
                 # Author statistics
                 if author_stats:
                     total_authors = author_stats['total_authors']
-                    authors_above_p99 = author_stats['authors_above_p99']
+                    authors_above_threshold = author_stats['authors_above_threshold']
+                    threshold_name = author_stats.get('threshold_name', 'p99')
                     authors_display = f"{total_authors}"
-                    above_p99_display = f"{authors_above_p99}"
+                    above_threshold_display = f"{authors_above_threshold}"
                 else:
                     authors_display = "N/A"
-                    above_p99_display = "N/A"
+                    above_threshold_display = "N/A"
                 
                 print(f"{year:<6} {total_funcs:<10} {unique_files:<8} {scored_count:<8} "
-                      f"{avg_score:<12.4f} {min_score:<12.4f} {max_score:<12.4f} {p90_score:<12.4f} {authors_display:<8} {above_p99_display:<10} {status:<10}")
+                      f"{avg_score:<12.4f} {min_score:<12.4f} {max_score:<12.4f} {p90_score:<12.4f} {authors_display:<8} {above_threshold_display:<10} {status:<10}")
             else:
                 status = "NO_SCORES"
                 print(f"{year:<6} {total_funcs:<10} {unique_files:<8} {'0':<8} "
-                      f"{'N/A':<12} {'N/A':<12} {'N/A':<12} {'N/A':<12} {'N/A':<8} {'N/A':<10} {status:<10}")
+                      f"{'N/A':<12} {'N/A':<12} {'N/A':<12} {'N/A':<12} {'N/A':<8} {'N/A':<12} {status:<10}")
         
         # Function type breakdown for repository
         print(f"\nFunction Types Across All Years:")
@@ -1266,23 +1281,29 @@ def print_repo_year_summaries(summaries: List[Dict[str, Any]]):
         if author_summaries:
             print(f"\nAuthor Analysis Across All Years:")
             total_repo_authors = sum(s['author_statistics']['total_authors'] for s in author_summaries)
-            total_repo_authors_above_p99 = sum(s['author_statistics']['authors_above_p99'] for s in author_summaries)
-            avg_p99_percentage = np.mean([s['author_statistics']['author_p99_percentage'] for s in author_summaries])
+            total_repo_authors_above_threshold = sum(s['author_statistics']['authors_above_threshold'] for s in author_summaries)
+            avg_threshold_percentage = np.mean([s['author_statistics']['author_threshold_percentage'] for s in author_summaries])
+            
+            # Get threshold info from first summary
+            threshold_name = author_summaries[0]['author_statistics'].get('threshold_name', 'p99')
+            threshold_display = f"{threshold_name.upper()}" if threshold_name != 'p99' else "99th percentile"
             
             print(f"  Total unique authors across all years: {total_repo_authors}")
-            print(f"  Total authors with functions above 99th percentile: {total_repo_authors_above_p99}")
-            print(f"  Average percentage of authors above 99th percentile: {avg_p99_percentage:.2f}%")
+            print(f"  Total authors with functions above {threshold_display}: {total_repo_authors_above_threshold}")
+            print(f"  Average percentage of authors above {threshold_display}: {avg_threshold_percentage:.2f}%")
             
             # Year-by-year author breakdown
             print(f"\n  Author Statistics by Year:")
-            print(f"  {'Year':<6} {'Total Authors':<15} {'Above P99':<12} {'P99 Score':<12} {'Percentage':<12}")
-            print(f"  {'-' * 60}")
+            print(f"  {'Year':<6} {'Total Authors':<15} {'Above Threshold':<15} {'Threshold Score':<15} {'Percentage':<12}")
+            print(f"  {'-' * 75}")
             
             for summary in sorted(author_summaries, key=lambda x: x['year']):
                 year = summary['year']
                 author_stats = summary['author_statistics']
-                print(f"  {year:<6} {author_stats['total_authors']:<15} {author_stats['authors_above_p99']:<12} "
-                      f"{author_stats['p99_score']:<12.4f} {author_stats['author_p99_percentage']:<12.2f}%")
+                threshold_name = author_stats.get('threshold_name', 'p99')
+                threshold_display = f"{threshold_name.upper()}" if threshold_name != 'p99' else "P99"
+                print(f"  {year:<6} {author_stats['total_authors']:<15} {author_stats['authors_above_threshold']:<15} "
+                      f"{author_stats['threshold_score']:<15.4f} {author_stats['author_threshold_percentage']:<12.2f}%")
         
         # Detailed score analysis if available
         scored_summaries = [s for s in repo_summaries if s.get('score_statistics') and s['score_statistics']['functions_with_scores'] > 0]
@@ -1340,13 +1361,17 @@ def print_repo_year_summaries(summaries: List[Dict[str, Any]]):
     author_summaries = [s for s in summaries if s.get('author_statistics')]
     if author_summaries:
         grand_total_authors = sum(s['author_statistics']['total_authors'] for s in author_summaries)
-        grand_total_authors_above_p99 = sum(s['author_statistics']['authors_above_p99'] for s in author_summaries)
-        grand_avg_p99_percentage = np.mean([s['author_statistics']['author_p99_percentage'] for s in author_summaries])
+        grand_total_authors_above_threshold = sum(s['author_statistics']['authors_above_threshold'] for s in author_summaries)
+        grand_avg_threshold_percentage = np.mean([s['author_statistics']['author_threshold_percentage'] for s in author_summaries])
+        
+        # Get threshold info from first summary
+        threshold_name = author_summaries[0]['author_statistics'].get('threshold_name', 'p99')
+        threshold_display = f"{threshold_name.upper()}" if threshold_name != 'p99' else "99th percentile"
         
         print(f"\nOverall Author Statistics:")
         print(f"Total unique authors across all repos/years: {grand_total_authors}")
-        print(f"Total authors with functions above 99th percentile: {grand_total_authors_above_p99}")
-        print(f"Average percentage of authors above 99th percentile: {grand_avg_p99_percentage:.2f}%")
+        print(f"Total authors with functions above {threshold_display}: {grand_total_authors_above_threshold}")
+        print(f"Average percentage of authors above {threshold_display}: {grand_avg_threshold_percentage:.2f}%")
     
     # Overall score statistics
     scored_summaries = [s for s in summaries if s.get('score_statistics') and s['score_statistics']['functions_with_scores'] > 0]
